@@ -1,32 +1,32 @@
+# main.py
 import asyncio
 import json
 import os
 import time
-import math
 from datetime import datetime, timezone, timedelta
 from collections import deque
 
 import aiohttp
+from aiohttp import web
 import websockets
 import numpy as np
 
-# ================== CONFIG ==================
+# ================== CONFIG (defaults) ==================
 CONFIG = {
-    "symbol": "ethusdt",
-    "interval": "5m",
-    "bootstrap_candles": 50,
-    "cci_length": 9,
-    "signal_length": 9,
-    "signal_type": "ema",  # "sma" or "ema"
-    "detection_mode": "candle",  # "candle" or "tick"
-    "use_tick_updates": True,  # compute interim CCI within open candle
-    "zone_high": 0,   # overbought threshold
-    "zone_low": 0,   # oversold threshold
-    "min_cross_gap_minutes": 20,
-    "print_interval_sec": 15,
-    "close_grace_sec": 2,
+    "symbol": os.environ.get("SYMBOL", "ethusdt"),
+    "interval": os.environ.get("INTERVAL", "5m"),
+    "bootstrap_candles": int(os.environ.get("BOOTSTRAP_CANDLES", 50)),
+    "cci_length": int(os.environ.get("CCI_LENGTH", 9)),
+    "signal_length": int(os.environ.get("SIGNAL_LENGTH", 9)),
+    "signal_type": os.environ.get("SIGNAL_TYPE", "ema"),  # "sma" or "ema"
+    "detection_mode": os.environ.get("DETECTION_MODE", "candle"),  # "candle" or "tick"
+    "use_tick_updates": os.environ.get("USE_TICK_UPDATES", "True").lower() in ("1","true","yes"),
+    "zone_high": float(os.environ.get("ZONE_HIGH", 0)),
+    "zone_low": float(os.environ.get("ZONE_LOW", 0)),
+    "min_cross_gap_minutes": int(os.environ.get("MIN_CROSS_GAP_MINUTES", 20)),
+    "print_interval_sec": int(os.environ.get("PRINT_INTERVAL_SEC", 15)),
+    "close_grace_sec": int(os.environ.get("CLOSE_GRACE_SEC", 2)),
 
-    # Alerts
     "alerts": {
         "telegram": True,
         "playfile": False,
@@ -34,9 +34,9 @@ CONFIG = {
     },
     "alarm_file": "alarm.wav",
 
-    # Telegram
-    "TELEGRAM_TOKEN": "8396496933:AAHXlxYSkU3VBnfcJvWsm5fj8mtZxKqsXjA",
-    "CHAT_ID": "-4848836916"
+    # TELEGRAM: read from environment for safety
+    "TELEGRAM_TOKEN": os.environ.get("TELEGRAM_TOKEN", ""),
+    "CHAT_ID": os.environ.get("CHAT_ID", "")
 }
 # ============================================
 
@@ -56,6 +56,9 @@ async def send_telegram(msg):
         return
     token = CONFIG["TELEGRAM_TOKEN"]
     chat_id = CONFIG["CHAT_ID"]
+    if not token or not chat_id:
+        print("[telegram] token or chat_id not set; skipping telegram.")
+        return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
         async with aiohttp.ClientSession() as session:
@@ -117,7 +120,6 @@ async def check_cross():
                            CONFIG["signal_length"], CONFIG["signal_type"])
     prev_ema = signal
 
-    # Only print periodically
     global last_print_time
     if time.time() - last_print_time > CONFIG["print_interval_sec"]:
         print(f"[CCI] {now()} CCI={cci:.3f} Signal={signal}")
@@ -127,9 +129,8 @@ async def check_cross():
         return
     diff = cci - signal
 
-    # Zone conditions
-    in_zone_up = cci <= CONFIG["zone_low"]  # oversold recovery
-    in_zone_down = cci >= CONFIG["zone_high"]  # overbought reversal
+    in_zone_up = cci <= CONFIG["zone_low"]
+    in_zone_down = cci >= CONFIG["zone_high"]
 
     if prev_diff is not None:
         crossed_up = prev_diff < 0 and diff > 0 and in_zone_up
@@ -212,7 +213,7 @@ async def handle_trade(trade):
         if cci and signal and abs(cci - signal) < 5:
             print(f"[warn] approaching cross | CCI={cci:.2f} Signal={signal:.2f}")
 
-# ------------- MAIN ----------------
+# ------------- MAIN (background worker) ----------------
 async def ws_loop():
     url = f"wss://stream.binance.com:9443/ws/{CONFIG['symbol']}@trade"
     async with websockets.connect(url) as ws:
@@ -221,14 +222,45 @@ async def ws_loop():
             data = json.loads(msg)
             await handle_trade(data)
 
-async def main():
+async def worker_loop():
     await bootstrap()
     while True:
         try:
             await ws_loop()
+        except asyncio.CancelledError:
+            print("[worker] cancelled")
+            break
         except Exception as e:
             print("[ws] error", e)
             await asyncio.sleep(5)
 
+# ------------- SIMPLE HTTP SERVER (for health checks / keepalive) -------------
+async def health(request):
+    return web.Response(text="OK")
+
+async def on_startup(app):
+    print("[app] starting background worker")
+    app['worker_task'] = asyncio.create_task(worker_loop())
+
+async def on_cleanup(app):
+    print("[app] stopping background worker")
+    task = app.get('worker_task')
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+def create_app():
+    app = web.Application()
+    app.add_routes([web.get("/", health), web.get("/healthz", health)])
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+    return app
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    port = int(os.environ.get("PORT", os.environ.get("RENDER_PORT", 10000)))
+    app = create_app()
+    # listen on 0.0.0.0 so Render can reach you
+    web.run_app(app, host="0.0.0.0", port=port)
