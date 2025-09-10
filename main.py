@@ -18,11 +18,11 @@ CONFIG = {
     "bootstrap_candles": int(os.environ.get("BOOTSTRAP_CANDLES", 50)),
     "cci_length": int(os.environ.get("CCI_LENGTH", 9)),
     "signal_length": int(os.environ.get("SIGNAL_LENGTH", 9)),
-    "signal_type": os.environ.get("SIGNAL_TYPE", "ema"),  # "sma" or "ema"
-    "detection_mode": os.environ.get("DETECTION_MODE", "candle"),  # "candle" or "tick"
+    "signal_type": os.environ.get("SIGNAL_TYPE", "sma"),  # "sma" or "ema"
+    "detection_mode": os.environ.get("DETECTION_MODE", "tick"),  # "candle" or "tick"
     "use_tick_updates": os.environ.get("USE_TICK_UPDATES", "True").lower() in ("1","true","yes"),
-    "zone_high": float(os.environ.get("ZONE_HIGH", 0)),
-    "zone_low": float(os.environ.get("ZONE_LOW", 0)),
+    "zone_high": float(os.environ.get("ZONE_HIGH", 95)),
+    "zone_low": float(os.environ.get("ZONE_LOW", -95)),
     "min_cross_gap_minutes": int(os.environ.get("MIN_CROSS_GAP_MINUTES", 20)),
     "print_interval_sec": int(os.environ.get("PRINT_INTERVAL_SEC", 15)),
     "close_grace_sec": int(os.environ.get("CLOSE_GRACE_SEC", 2)),
