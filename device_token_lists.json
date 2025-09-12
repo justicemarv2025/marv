@@ -1,0 +1,17 @@
+{
+  "tokens": [
+    {
+      "token_id": "1",
+      "device_token": "caxSBBZcTbeuz5IuXJk6ss:APA91bHzi4L59kFJyp140giPhYfW2HGIC7pa3JU5Z_7sFHd04QdP_QcpexiggfhSo9g_BrnusKWeUcFx6pffLpvUcUxJ4w3hoWUlg4O2daSx7nk9SjKeBmk",
+      "purchased_date": "2024-01-15",
+      "expiring_date": "2055-01-15",
+      "is_active": true,
+      "device_type": "Android",
+      "customer_name": "Justicemarv"
+    }
+ 
+   ],
+  "last_updated": "2024-06-15T10:30:00Z",
+  "version": "1.0",
+  "description": "Device tokens for alert system with subscription status"
+}
