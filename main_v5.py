@@ -1,4 +1,4 @@
-# main_v5.py - Modified for concurrent execution
+# main_v5.py - Modified for concurrent execution with ETHUSDT
 import asyncio
 import json
 import os
@@ -13,7 +13,7 @@ import numpy as np
 
 # ================== CONFIG (defaults) ==================
 CONFIG = {
-    "symbol": os.environ.get("SYMBOL", "btcusdt"),  # Changed from ethusdt to avoid conflict
+    "symbol": os.environ.get("SYMBOL_V5", "ethusdt"),  # Changed to V5 but kept ethusdt
     "interval": os.environ.get("INTERVAL", "5m"),
     "bootstrap_candles": int(os.environ.get("BOOTSTRAP_CANDLES", 50)),
     "cci_length": int(os.environ.get("CCI_LENGTH", 9)),
@@ -36,11 +36,11 @@ CONFIG = {
     "alarm_file": "alarm.wav",
 
     # TELEGRAM: read from environment for safety
-    "TELEGRAM_TOKEN": os.environ.get("TELEGRAM_TOKEN_V5", ""),  # Changed to avoid conflict
-    "CHAT_ID": os.environ.get("CHAT_ID_V5", ""),  # Changed to avoid conflict
+    "TELEGRAM_TOKEN": os.environ.get("TELEGRAM_TOKEN5", ""),  # Changed to avoid conflict
+    "CHAT_ID": os.environ.get("CHAT_ID", ""),  # Changed to avoid conflict
 
     # FCM: Firebase Cloud Messaging
-    "FCM_TOKEN": os.environ.get("FCM_TOKEN_V5", ""),  # Changed to avoid conflict
+    "FCM_TOKEN": os.environ.get("FCM_TOKEN", ""),  # Changed to avoid conflict
     "FCM_TOPIC": os.environ.get("FCM_TOPIC_V5", "cci_alerts_v5")  # Changed to avoid conflict
 }
 # ============================================
@@ -63,14 +63,14 @@ async def send_telegram(msg):
     token = CONFIG["TELEGRAM_TOKEN"]
     chat_id = CONFIG["CHAT_ID"]
     if not token or not chat_id:
-        print("[telegram] token or chat_id not set; skipping telegram.")
+        print("[telegram-V5] token or chat_id not set; skipping telegram.")
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
         async with aiohttp.ClientSession() as session:
             await session.post(url, data={"chat_id": chat_id, "text": msg})
     except Exception as e:
-        print("[telegram] error", e)
+        print("[telegram-V5] error", e)
 
 async def send_fcm_notification(title, message):
     if not CONFIG["alerts"]["fcm"]:
@@ -78,7 +78,7 @@ async def send_fcm_notification(title, message):
     token = CONFIG["FCM_TOKEN"]
     topic = CONFIG["FCM_TOPIC"]
     if not token:
-        print("[FCM] token not set; skipping FCM notification.")
+        print("[FCM-V5] token not set; skipping FCM notification.")
         return
     url = "https://fcm.googleapis.com/fcm/send"
     headers = {"Authorization": f"key={token}", "Content-Type": "application/json"}
@@ -91,28 +91,28 @@ async def send_fcm_notification(title, message):
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, headers=headers) as resp:
                 if resp.status != 200:
-                    print(f"[FCM] Error {resp.status}: {await resp.text()}")
+                    print(f"[FCM-V5] Error {resp.status}: {await resp.text()}")
                 else:
-                    print("[FCM] Notification sent successfully")
+                    print("[FCM-V5] Notification sent successfully")
     except Exception as e:
-        print("[FCM] error", e)
+        print("[FCM-V5] error", e)
 
 def play_alert():
     if CONFIG["alerts"]["plyer"]:
         try:
             from plyer import notification
-            notification.notify(title="CCI Alert", message="Signal cross", timeout=5)
+            notification.notify(title="CCI Alert V5", message="Signal cross", timeout=5)
         except Exception as e:
-            print("[plyer] error", e)
+            print("[plyer-V5] error", e)
     if CONFIG["alerts"]["playfile"]:
         if os.path.exists(CONFIG["alarm_file"]):
             try:
                 import playsound
                 playsound.playsound(CONFIG["alarm_file"])
             except Exception as e:
-                print("[playfile] error", e)
+                print("[playfile-V5] error", e)
         else:
-            print(f"[warning] alarm_file '{CONFIG['alarm_file']}' not found.")
+            print(f"[warning-V5] alarm_file '{CONFIG['alarm_file']}' not found.")
 
 # ------------- CCI CALC ----------------
 def compute_cci(candles, length=20):
