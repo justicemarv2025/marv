@@ -1,31 +1,60 @@
-# main_v5.py - Modified for concurrent execution with ETHUSDT
 import asyncio
 import json
 import os
 import time
 from datetime import datetime, timezone, timedelta
 from collections import deque
+from typing import Dict, Deque, Optional
 
 import aiohttp
 from aiohttp import web
 import websockets
 import numpy as np
+import firebase_admin
+from firebase_admin import credentials, messaging
 
-# ================== CONFIG (defaults) ==================
+# ========== ENVIRONMENT SETUP ==========
+IS_PRODUCTION = os.environ.get('RENDER', False) or os.environ.get('PYTHONANYWHERE', False) or os.environ.get('HEROKU', False)
+
+if not IS_PRODUCTION:
+    try:
+        from dotenv import load_dotenv
+        env_path = None
+        if os.path.exists('.gitignore/.env'):
+            env_path = '.gitignore/.env'
+        elif os.path.exists('.env'):
+            env_path = '.env'
+        if env_path:
+            load_dotenv(env_path)
+            print(f"Loaded environment from {env_path}")
+        else:
+            print("No .env file found, using system environment variables")
+    except ImportError:
+        print("python-dotenv not installed, using system environment variables")
+else:
+    print("Running in production environment, using system environment variables")
+# =======================================
+
+# ================== CONFIG ==================
+SYMBOLS = [
+    "solusdt", "uniusdt", "linkusdt", "aaveusdt", "tonusdt",
+    "barusdt", "fetusdt", "woousdt", "bchusdt", "ethusdt"
+]
+
 CONFIG = {
-    "symbol": os.environ.get("SYMBOL_V5", "ethusdt"),  # Changed to V5 but kept ethusdt
-    "interval": os.environ.get("INTERVAL", "5m"),
-    "bootstrap_candles": int(os.environ.get("BOOTSTRAP_CANDLES", 50)),
-    "cci_length": int(os.environ.get("CCI_LENGTH", 9)),
-    "signal_length": int(os.environ.get("SIGNAL_LENGTH", 9)),
-    "signal_type": os.environ.get("SIGNAL_TYPE", "sma"),  # "sma" or "ema"
-    "detection_mode": os.environ.get("DETECTION_MODE", "tick"),  # "candle" or "tick"
-    "use_tick_updates": os.environ.get("USE_TICK_UPDATES", "True").lower() in ("1","true","yes"),
-    "zone_high": float(os.environ.get("ZONE_HIGH", 95)),
-    "zone_low": float(os.environ.get("ZONE_LOW", -95)),
-    "min_cross_gap_minutes": int(os.environ.get("MIN_CROSS_GAP_MINUTES", 20)),
-    "print_interval_sec": int(os.environ.get("PRINT_INTERVAL_SEC", 15)),
-    "close_grace_sec": int(os.environ.get("CLOSE_GRACE_SEC", 2)),
+    "symbols": SYMBOLS,
+    "interval": "5m",
+    "bootstrap_candles": 50,
+    "cci_length": 9,
+    "signal_length": 9,
+    "signal_type": "sma",
+    "detection_mode": "tick",
+    "use_tick_updates": True,
+    "zone_high": 95,
+    "zone_low": -95,
+    "min_cross_gap_minutes": 20,
+    "print_interval_sec": 15,
+    "close_grace_sec": 2,
 
     "alerts": {
         "telegram": True,
@@ -35,23 +64,115 @@ CONFIG = {
     },
     "alarm_file": "alarm.wav",
 
-    # TELEGRAM: read from environment for safety
-    "TELEGRAM_TOKEN": os.environ.get("TELEGRAM_TOKEN5", ""),  # Changed to avoid conflict
-    "CHAT_ID": os.environ.get("CHAT_ID", ""),  # Changed to avoid conflict
-
-    # FCM: Firebase Cloud Messaging
-    "FCM_TOKEN": os.environ.get("FCM_TOKEN", ""),  # Changed to avoid conflict
-    "FCM_TOPIC": os.environ.get("FCM_TOPIC_V5", "cci_alerts_v5")  # Changed to avoid conflict
+    "TELEGRAM_TOKEN": os.environ.get("TELEGRAM_TOKEN", ""),
+    "CHAT_ID": os.environ.get("CHAT_ID", ""),
+    "DEVICE_TOKENS_FILE": "device_token_lists.json"
 }
 # ============================================
 
-completed_candles = deque(maxlen=500)
-current_candle = None
-last_cross_time = None
-prev_diff = None
-signal_history = deque(maxlen=100)
-prev_signal = None
-last_print_time = 0
+# Data structures for each symbol
+symbol_data: Dict[str, Dict] = {}
+
+# Initialize data structures for each symbol
+for symbol in SYMBOLS:
+    symbol_data[symbol] = {
+        "completed_candles": deque(maxlen=500),
+        "current_candle": None,
+        "last_cross_time": None,
+        "prev_diff": None,
+        "signal_history": deque(maxlen=100),
+        "prev_signal": None,
+        "last_print_time": 0
+    }
+
+# Firebase app instance
+firebase_app = None
+
+# ------------- FCM INITIALIZATION ----------------
+def init_firebase():
+    global firebase_app
+    if not CONFIG["alerts"]["fcm"]:
+        print("[FCM] FCM alerts disabled in config")
+        return
+    
+    try:
+        firebase_cred_json = os.environ.get("FIREBASE_CREDENTIALS")
+        if not firebase_cred_json:
+            print("[FCM] FIREBASE_CREDENTIALS environment variable not set")
+            return
+            
+        cred_dict = json.loads(firebase_cred_json)
+        if 'private_key' in cred_dict:
+            cred_dict['private_key'] = cred_dict['private_key'].replace('\\n', '\n')
+        
+        cred = credentials.Certificate(cred_dict)
+        firebase_app = firebase_admin.initialize_app(cred)
+        print("[FCM] Firebase app initialized successfully")
+        
+    except json.JSONDecodeError as e:
+        print(f"[FCM] Error parsing FIREBASE_CREDENTIALS: {e}")
+    except Exception as e:
+        print(f"[FCM] init error: {e}")
+        firebase_app = None
+
+def load_valid_tokens():
+    if not CONFIG["alerts"]["fcm"]:
+        return []
+    
+    try:
+        with open(CONFIG["DEVICE_TOKENS_FILE"], "r") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(f"[FCM] {CONFIG['DEVICE_TOKENS_FILE']} not found")
+        return []
+    except json.JSONDecodeError:
+        print(f"[FCM] Invalid JSON in {CONFIG['DEVICE_TOKENS_FILE']}")
+        return []
+
+    today = datetime.now().date()
+    valid = []
+    for t in data.get("tokens", []):
+        exp = t.get("expiring_date")
+        if not exp:
+            continue
+        try:
+            expiry = datetime.strptime(exp, "%Y-%m-%d").date()
+            if expiry >= today:
+                valid.append({
+                    "token": t["device_token"],
+                    "customer": t.get("customer_name", "Unknown")
+                })
+        except ValueError:
+            continue
+    return valid
+
+def send_fcm_alert(action="play", message="CCI Alert Triggered"):
+    if not CONFIG["alerts"]["fcm"]:
+        return
+    
+    if not firebase_app:
+        print("[FCM] not initialized, skipping")
+        return
+
+    tokens = load_valid_tokens()
+    if not tokens:
+        print("[FCM] no valid subscribers")
+        return
+
+    for t in tokens:
+        try:
+            msg = messaging.Message(
+                data={
+                    "action": action,
+                    "timestamp": datetime.now().isoformat(),
+                    "message": message
+                },
+                token=t["token"]
+            )
+            resp = messaging.send(msg)
+            print(f"✓ FCM Message sent to {t['customer']}: {t['token'][:15]}... id={resp}")
+        except Exception as e:
+            print(f"✗ Failed to send FCM to {t['customer']}: {e}")
 
 # ------------- UTILITIES ----------------
 def now():
@@ -63,23 +184,28 @@ async def send_telegram(msg):
     token = CONFIG["TELEGRAM_TOKEN"]
     chat_id = CONFIG["CHAT_ID"]
     if not token or not chat_id:
-        print("[telegram-V5] token or chat_id not set; skipping telegram.")
+        print("[telegram] token or chat_id not set; skipping telegram.")
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
         async with aiohttp.ClientSession() as session:
             await session.post(url, data={"chat_id": chat_id, "text": msg})
     except Exception as e:
-        print("[telegram-V5] error", e)
+        print("[telegram] error", e)
 
 async def send_fcm_notification(title, message):
     if not CONFIG["alerts"]["fcm"]:
         return
-    token = CONFIG["FCM_TOKEN"]
-    topic = CONFIG["FCM_TOPIC"]
+    
+    if firebase_app:
+        send_fcm_alert("play", f"{title}: {message}")
+    
+    token = os.environ.get("FCM_TOKEN", "")
+    topic = os.environ.get("FCM_TOPIC", "cci_alerts")
     if not token:
-        print("[FCM-V5] token not set; skipping FCM notification.")
+        print("[FCM HTTP] token not set; skipping FCM HTTP notification.")
         return
+    
     url = "https://fcm.googleapis.com/fcm/send"
     headers = {"Authorization": f"key={token}", "Content-Type": "application/json"}
     payload = {
@@ -91,28 +217,17 @@ async def send_fcm_notification(title, message):
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, headers=headers) as resp:
                 if resp.status != 200:
-                    print(f"[FCM-V5] Error {resp.status}: {await resp.text()}")
-                else:
-                    print("[FCM-V5] Notification sent successfully")
+                    print(f"[FCM HTTP] Error {resp.status}: {await resp.text()}")
     except Exception as e:
-        print("[FCM-V5] error", e)
+        print("[FCM HTTP] error", e)
 
 def play_alert():
-    if CONFIG["alerts"]["plyer"]:
+    if CONFIG["alerts"]["playfile"] and os.path.exists(CONFIG["alarm_file"]):
         try:
-            from plyer import notification
-            notification.notify(title="CCI Alert V5", message="Signal cross", timeout=5)
-        except Exception as e:
-            print("[plyer-V5] error", e)
-    if CONFIG["alerts"]["playfile"]:
-        if os.path.exists(CONFIG["alarm_file"]):
-            try:
-                import playsound
-                playsound.playsound(CONFIG["alarm_file"])
-            except Exception as e:
-                print("[playfile-V5] error", e)
-        else:
-            print(f"[warning-V5] alarm_file '{CONFIG['alarm_file']}' not found.")
+            import playsound
+            playsound.playsound(CONFIG["alarm_file"])
+        except Exception:
+            pass
 
 # ------------- CCI CALC ----------------
 def compute_cci(candles, length=20):
@@ -135,71 +250,67 @@ def update_signal(cci_values, length, signal_type="ema"):
     if signal_type == "sma":
         return np.mean(cci_values[-length:])
     else:
-        # EMA-like weighting
         cci_array = np.array(cci_values[-length:])
         weights = np.exp(np.linspace(-1, 0, length))
         weights /= weights.sum()
         return np.dot(cci_array, weights)
 
 # ------------- ALERT CHECK ----------------
-async def check_cross():
-    global prev_diff, last_cross_time, prev_signal, signal_history
-
+async def check_cross(symbol: str):
+    data = symbol_data[symbol]
+    completed_candles = data["completed_candles"]
+    signal_history = data["signal_history"]
+    
     cci = compute_cci(list(completed_candles), CONFIG["cci_length"])
     if cci is None:
         return
+    
     signal_history.append(cci)
     signal = update_signal(list(signal_history), CONFIG["signal_length"], CONFIG["signal_type"])
     if signal is None:
         return
-    prev_signal = signal
+    
+    data["prev_signal"] = signal
 
-    global last_print_time
-    if time.time() - last_print_time > CONFIG["print_interval_sec"]:
-        print(f"[CCI-V5] {now()} CCI={cci:.3f} Signal={signal:.3f}")  # Added V5 identifier
-        last_print_time = time.time()
+    if time.time() - data["last_print_time"] > CONFIG["print_interval_sec"]:
+        print(f"[CCI-{symbol.upper()}] {now()} CCI={cci:.3f} Signal={signal:.3f}")
+        data["last_print_time"] = time.time()
 
     diff = cci - signal
+    prev_diff = data["prev_diff"]
 
-    # simplified: ignore zone for testing
     crossed_up = prev_diff is not None and prev_diff < 0 and diff > 0
     crossed_down = prev_diff is not None and prev_diff > 0 and diff < 0
 
     if crossed_up or crossed_down:
         current_time = now()
-        time_since_last = current_time - last_cross_time if last_cross_time else timedelta(minutes=CONFIG["min_cross_gap_minutes"] + 1)
-        if last_cross_time is None or time_since_last > timedelta(minutes=CONFIG["min_cross_gap_minutes"]):
-            last_cross_time = current_time
+        time_since_last = current_time - data["last_cross_time"] if data["last_cross_time"] else timedelta(minutes=CONFIG["min_cross_gap_minutes"] + 1)
+        
+        if data["last_cross_time"] is None or time_since_last > timedelta(minutes=CONFIG["min_cross_gap_minutes"]):
+            data["last_cross_time"] = current_time
             direction = "UP" if crossed_up else "DOWN"
-            msg = f"🚨 CCI-V5 CROSS {direction} | CCI={cci:.2f} Signal={signal:.2f} Time={current_time}"  # Added V5 identifier
-            print("[alert-V5]", msg)  # Added V5 identifier
+            msg = f"🚨 {symbol.upper()} CCI CROSS {direction} | CCI={cci:.2f} Signal={signal:.2f} Time={current_time}"
+            print(f"[alert-{symbol.upper()}]", msg)
             await send_telegram(msg)
-            await send_fcm_notification(f"CCI-V5 Cross {direction}", f"CCI: {cci:.2f}, Signal: {signal:.2f}")  # Added V5 identifier
+            await send_fcm_notification(f"{symbol.upper()} CCI Cross {direction}", f"CCI: {cci:.2f}, Signal: {signal:.2f}")
             play_alert()
 
-    prev_diff = diff
+    data["prev_diff"] = diff
 
 # ------------- DATA HANDLING ----------------
-def build_candle(kline):
-    return {
-        "open_time": int(kline[0]),
-        "open": float(kline[1]),
-        "high": float(kline[2]),
-        "low": float(kline[3]),
-        "close": float(kline[4]),
-        "volume": float(kline[5]),
-        "close_time": int(kline[6])
-    }
-
-async def bootstrap():
-    url = f"https://api.binance.com/api/v3/klines?symbol={CONFIG['symbol'].upper()}&interval={CONFIG['interval']}&limit={CONFIG['bootstrap_candles']}"
+async def bootstrap(symbol: str):
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval={CONFIG['interval']}&limit={CONFIG['bootstrap_candles']}"
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
             data = await resp.json()
+    
     if "code" in data:
-        print(f"[bootstrap-V5] error from Binance: {data}")  # Added V5 identifier
+        print(f"[bootstrap-{symbol.upper()}] error from Binance: {data}")
         return
-    print(f"[bootstrap-V5] fetched {len(data)} candles")  # Added V5 identifier
+    
+    completed_candles = symbol_data[symbol]["completed_candles"]
+    signal_history = symbol_data[symbol]["signal_history"]
+    
     for k in data:
         candle = {
             "open": float(k[1]),
@@ -211,80 +322,90 @@ async def bootstrap():
         cci_val = compute_cci(list(completed_candles), CONFIG["cci_length"])
         if cci_val is not None:
             signal_history.append(cci_val)
-    print(f"[bootstrap-V5] completed_candles: {len(completed_candles)}, signal_history: {len(signal_history)}")  # Added V5 identifier
+    
+    print(f"[bootstrap-{symbol.upper()}] completed_candles: {len(completed_candles)}, signal_history: {len(signal_history)}")
 
-async def handle_trade(trade):
-    global current_candle
+async def handle_trade(symbol: str, trade: dict):
+    data = symbol_data[symbol]
     price = float(trade['p'])
     ts = int(trade['T'])
     dt = datetime.fromtimestamp(ts/1000, tz=timezone.utc)
     minute = dt.minute - dt.minute % 5
     candle_open = dt.replace(second=0, microsecond=0, minute=minute)
 
-    if current_candle is None or candle_open != current_candle["time"]:
-        if current_candle:
-            # close previous candle
-            completed_candles.append({
-                "open": current_candle["open"],
-                "high": current_candle["high"],
-                "low": current_candle["low"],
-                "close": current_candle["close"]
+    if data["current_candle"] is None or candle_open != data["current_candle"]["time"]:
+        if data["current_candle"]:
+            data["completed_candles"].append({
+                "open": data["current_candle"]["open"],
+                "high": data["current_candle"]["high"],
+                "low": data["current_candle"]["low"],
+                "close": data["current_candle"]["close"]
             })
-            print(f"[candle-V5] closed {current_candle['time']} o:{current_candle['open']} h:{current_candle['high']} l:{current_candle['low']} c:{current_candle['close']}")  # Added V5 identifier
-            await check_cross()
-        current_candle = {"time": candle_open, "open": price, "high": price, "low": price, "close": price}
-        print(f"[candle-V5] opened new candle at {candle_open}")  # Added V5 identifier
+            print(f"[candle-{symbol.upper()}] closed {data['current_candle']['time']}")
+            await check_cross(symbol)
+        
+        data["current_candle"] = {"time": candle_open, "open": price, "high": price, "low": price, "close": price}
+        print(f"[candle-{symbol.upper()}] opened new candle at {candle_open}")
     else:
-        current_candle["close"] = price
-        current_candle["high"] = max(current_candle["high"], price)
-        current_candle["low"] = min(current_candle["low"], price)
+        data["current_candle"]["close"] = price
+        data["current_candle"]["high"] = max(data["current_candle"]["high"], price)
+        data["current_candle"]["low"] = min(data["current_candle"]["low"], price)
 
     if CONFIG["use_tick_updates"]:
-        tmp_candles = list(completed_candles) + [{
-            "open": current_candle["open"],
-            "high": current_candle["high"],
-            "low": current_candle["low"],
-            "close": current_candle["close"]
+        tmp_candles = list(data["completed_candles"]) + [{
+            "open": data["current_candle"]["open"],
+            "high": data["current_candle"]["high"],
+            "low": data["current_candle"]["low"],
+            "close": data["current_candle"]["close"]
         }]
         cci = compute_cci(tmp_candles, CONFIG["cci_length"])
         if cci:
-            tmp_signal_history = list(signal_history) + [cci]
+            tmp_signal_history = list(data["signal_history"]) + [cci]
             signal = update_signal(tmp_signal_history, CONFIG["signal_length"], CONFIG["signal_type"])
             if signal:
-                print(f"[tick-V5] price={price:.2f} CCI={cci:.2f} Signal={signal:.2f} Diff={cci-signal:.2f}")  # Added V5 identifier
+                print(f"[tick-{symbol.upper()}] price={price:.2f} CCI={cci:.2f} Signal={signal:.2f}")
 
-# ------------- MAIN (background worker) ----------------
-async def ws_loop():
-    url = f"wss://stream.binance.com:9443/ws/{CONFIG['symbol']}@trade"
+# ------------- WEBSOCKET HANDLING ----------------
+async def ws_loop(symbol: str):
+    url = f"wss://stream.binance.com:9443/ws/{symbol}@trade"
     async with websockets.connect(url) as ws:
-        print(f"[ws-V5] connected to {url}")  # Added V5 identifier
+        print(f"[ws-{symbol.upper()}] connected to {url}")
         async for msg in ws:
             data = json.loads(msg)
-            print(f"[ws-V5] received trade: {data['p']} at {datetime.fromtimestamp(data['T']/1000, tz=timezone.utc)}")  # Added V5 identifier
-            await handle_trade(data)
+            await handle_trade(symbol, data)
 
-async def worker_loop():
-    await bootstrap()
+async def symbol_worker(symbol: str):
+    await bootstrap(symbol)
     while True:
         try:
-            await ws_loop()
+            await ws_loop(symbol)
         except asyncio.CancelledError:
-            print("[worker-V5] cancelled")  # Added V5 identifier
+            print(f"[worker-{symbol.upper()}] cancelled")
             break
         except Exception as e:
-            print("[ws-V5] error", e)  # Added V5 identifier
+            print(f"[ws-{symbol.upper()}] error: {e}")
             await asyncio.sleep(5)
 
-# ------------- SIMPLE HTTP SERVER (for health checks / keepalive) -------------
+async def worker_loop():
+    print("[init alert] Sending initialization alert")
+    send_fcm_alert("play", "Multi-Symbol CCI Alert System Initialization complete")
+    await send_telegram("Multi-Symbol CCI Alert System Initialization complete")
+    
+    # Start a worker for each symbol
+    tasks = [asyncio.create_task(symbol_worker(symbol)) for symbol in SYMBOLS]
+    await asyncio.gather(*tasks)
+
+# ------------- HTTP SERVER ----------------
 async def health(request):
-    return web.Response(text="OK-V5")  # Changed response to identify V5
+    return web.Response(text="Multi-Symbol CCI Alert System OK")
 
 async def on_startup(app):
-    print("[app-V5] starting background worker")  # Added V5 identifier
+    print("[app] starting background workers")
+    init_firebase()
     app['worker_task'] = asyncio.create_task(worker_loop())
 
 async def on_cleanup(app):
-    print("[app-V5] stopping background worker")  # Added V5 identifier
+    print("[app] stopping background workers")
     task = app.get('worker_task')
     if task:
         task.cancel()
@@ -301,7 +422,6 @@ def create_app():
     return app
 
 if __name__ == "__main__":
-    # Use a different port to avoid conflict with main.py
-    port = int(os.environ.get("PORT_V5", 10001))  # Changed to PORT_V5 and default to 10001
+    port = int(os.environ.get("PORT", 10001))  # Changed to 10001 to avoid conflict
     app = create_app()
     web.run_app(app, host="0.0.0.0", port=port)
