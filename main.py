@@ -37,8 +37,7 @@ else:
 
 # ================== CONFIG ==================
 SYMBOLS = [
-    "solusdt", "uniusdt", "linkusdt", "aaveusdt", "tonusdt",
-    "barusdt", "fetusdt", "woousdt", "bchusdt", "ethusdt"
+    "solusdt", "bchusdt", "ethusdt"
 ]
 
 CONFIG = {
