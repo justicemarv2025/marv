@@ -4,7 +4,7 @@ import os
 import time
 from datetime import datetime, timezone, timedelta
 from collections import deque
-from typing import Dict, Deque, Optional
+from typing import Dict, Deque, Optional, List
 
 import aiohttp
 from aiohttp import web
@@ -36,6 +36,7 @@ else:
 # =======================================
 
 # ================== CONFIG ==================
+# CONSIDER REDUCING THIS LIST FOR BETTER PERFORMANCE ON RENDER
 SYMBOLS = [
     "solusdt", "bchusdt", "ethusdt"
 ]
@@ -47,20 +48,21 @@ CONFIG = {
     "cci_length": 9,
     "signal_length": 9,
     "signal_type": "sma",
-    "detection_mode": "tick",
-    "use_tick_updates": True,
     "zone_high": 95,
     "zone_low": -95,
     "min_cross_gap_minutes": 20,
-    "print_interval_sec": 15,
+    "print_interval_sec": 30,  # Reduced print frequency
     "close_grace_sec": 2,
     "signal_minute": 4,      # Signal at 4 minutes into the candle
     "signal_second": 45,     # Signal at 45 seconds into the 4th minute
 
+    # CRITICAL PERFORMANCE SETTING: Disable to stop calculating CCI on every trade
+    "use_tick_updates": False,
+
     "alerts": {
         "telegram": True,
-        "playfile": False,
-        "plyer": False,
+        "playfile": False,    # Disabled on server
+        "plyer": False,       # Disabled on server
         "fcm": True
     },
     "alarm_file": "alarm.wav",
@@ -85,7 +87,8 @@ for symbol in SYMBOLS:
         "prev_signal": None,
         "last_print_time": 0,
         "signal_sent_this_candle": False,  # Track if signal was already sent this candle
-        "prev_diff_early": None  # Track previous diff for early crossover detection
+        "prev_diff_early": None,  # Track previous diff for early crossover detection
+        "last_early_check_time": 0 # Track the last time we did an early check for this symbol
     }
 
 # Firebase app instance
@@ -179,7 +182,7 @@ def send_fcm_alert(action="play", message="CCI Alert Triggered"):
 
 # ------------- UTILITIES ----------------
 def now():
-    return datetime.now(timezone.utc).astimezone()
+    return datetime.now(timezone.utc)
 
 async def send_telegram(msg):
     if not CONFIG["alerts"]["telegram"]:
@@ -225,12 +228,8 @@ async def send_fcm_notification(title, message):
         print("[FCM HTTP] error", e)
 
 def play_alert():
-    if CONFIG["alerts"]["playfile"] and os.path.exists(CONFIG["alarm_file"]):
-        try:
-            import playsound
-            playsound.playsound(CONFIG["alarm_file"])
-        except Exception:
-            pass
+    # Disabled on server
+    pass
 
 # ------------- CCI CALC ----------------
 def compute_cci(candles, length=20):
@@ -266,6 +265,8 @@ async def check_cross(symbol: str, use_early_detection=False):
     
     # For early detection, include the current candle
     if use_early_detection:
+        if data["current_candle"] is None:
+            return
         tmp_candles = list(completed_candles) + [{
             "open": data["current_candle"]["open"],
             "high": data["current_candle"]["high"],
@@ -318,20 +319,28 @@ async def check_cross(symbol: str, use_early_detection=False):
             print(f"[alert-{symbol.upper()}]", msg)
             await send_telegram(msg)
             await send_fcm_notification(f"{symbol.upper()} CCI Cross {direction}", f"CCI: {cci:.2f}, Signal: {signal:.2f}")
-            play_alert()
             
             # Mark signal as sent for this candle if it's an early detection
             if use_early_detection:
                 data["signal_sent_this_candle"] = True
+                data["last_early_check_time"] = time.time()
 
     data[data_key] = diff
 
 # ------------- DATA HANDLING ----------------
 async def bootstrap(symbol: str):
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval={CONFIG['interval']}&limit={CONFIG['bootstrap_candles']}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            data = await resp.json()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                data = await resp.json()
+    except Exception as e:
+        print(f"[bootstrap-{symbol.upper()}] Failed to fetch data: {e}")
+        await asyncio.sleep(5)
+        # Retry once
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                data = await resp.json()
     
     if "code" in data:
         print(f"[bootstrap-{symbol.upper()}] error from Binance: {data}")
@@ -384,18 +393,7 @@ async def handle_trade(symbol: str, trade: dict):
         data["current_candle"]["high"] = max(data["current_candle"]["high"], price)
         data["current_candle"]["low"] = min(data["current_candle"]["low"], price)
 
-    # Check if it's time to check for early crossover (4 minutes 45 seconds into the candle)
-    current_time = now()
-    candle_start = data["current_candle"]["time"]
-    time_in_candle = current_time - candle_start
-    
-    # Check if we're at the right time in the candle and haven't sent a signal yet
-    if (time_in_candle.total_seconds() >= CONFIG["signal_minute"] * 60 + CONFIG["signal_second"] and 
-        not data["signal_sent_this_candle"]):
-        
-        # Check for crossover using current incomplete candle data
-        await check_cross(symbol, use_early_detection=True)
-
+    # PERFORMANCE CRITICAL: Only calculate on tick if explicitly enabled (NOT recommended)
     if CONFIG["use_tick_updates"]:
         tmp_candles = list(data["completed_candles"]) + [{
             "open": data["current_candle"]["open"],
@@ -408,37 +406,86 @@ async def handle_trade(symbol: str, trade: dict):
             tmp_signal_history = list(data["signal_history"]) + [cci]
             signal = update_signal(tmp_signal_history, CONFIG["signal_length"], CONFIG["signal_type"])
             if signal:
-                print(f"[tick-{symbol.upper()}] price={price:.2f} CCI={cci:.2f} Signal={signal:.2f}")
+                # Comment out this print to save CPU
+                # print(f"[tick-{symbol.upper()}] price={price:.2f} CCI={cci:.2f} Signal={signal:.2f}")
+                pass
+
+# ------------- DEDICATED EARLY SIGNAL TIMER ----------------
+async def check_early_signals_periodically():
+    """
+    A dedicated task that runs every second to check if it's time for an early signal.
+    This prevents the check from being blocked by trade processing.
+    """
+    print("[Early Signal Timer] Started dedicated early signal timer task.")
+    while True:
+        current_utc_time = now()
+        # Check every second for high precision
+        await asyncio.sleep(1)
+
+        for symbol in CONFIG['symbols']:
+            data = symbol_data[symbol]
+            # If there's no current candle, skip
+            if data["current_candle"] is None:
+                continue
+
+            # Check if we've already sent a signal for this candle
+            if data["signal_sent_this_candle"]:
+                continue
+
+            candle_start = data["current_candle"]["time"]
+            # Check if we are past the early signal time for this candle
+            time_in_candle = current_utc_time - candle_start
+            target_time_sec = (CONFIG["signal_minute"] * 60) + CONFIG["signal_second"]
+
+            # Check if we are in the target second
+            if time_in_candle.total_seconds() >= target_time_sec:
+                # Check if we already did the check this second (avoid duplicates)
+                if time.time() - data["last_early_check_time"] > 0.5:
+                    print(f"[{symbol.upper()}] ⌛ PERIODIC CHECK: Triggering early signal at {current_utc_time} ({time_in_candle.total_seconds():.1f}s into candle)")
+                    await check_cross(symbol, use_early_detection=True)
 
 # ------------- WEBSOCKET HANDLING ----------------
 async def ws_loop(symbol: str):
     url = f"wss://stream.binance.com:9443/ws/{symbol}@trade"
-    async with websockets.connect(url) as ws:
-        print(f"[ws-{symbol.upper()}] connected to {url}")
-        async for msg in ws:
-            data = json.loads(msg)
-            await handle_trade(symbol, data)
-
-async def symbol_worker(symbol: str):
-    await bootstrap(symbol)
-    while True:
+    retry_count = 0
+    max_retries = 10
+    while retry_count < max_retries:
         try:
-            await ws_loop(symbol)
+            async with websockets.connect(url) as ws:
+                print(f"[ws-{symbol.upper()}] connected to {url}")
+                retry_count = 0 # Reset retry count on successful connection
+                async for msg in ws:
+                    data = json.loads(msg)
+                    await handle_trade(symbol, data)
         except asyncio.CancelledError:
             print(f"[worker-{symbol.upper()}] cancelled")
             break
         except Exception as e:
-            print(f"[ws-{symbol.upper()}] error: {e}")
-            await asyncio.sleep(5)
+            retry_count += 1
+            wait_time = min(2 ** retry_count, 30) # Exponential backoff, max 30 sec
+            print(f"[ws-{symbol.upper()}] error (Attempt {retry_count}/{max_retries}): {e}. Retrying in {wait_time}s...")
+            await asyncio.sleep(wait_time)
+    print(f"[ws-{symbol.upper()}] Failed to connect after {max_retries} attempts. Stopping.")
+
+async def symbol_worker(symbol: str):
+    await bootstrap(symbol)
+    await ws_loop(symbol)
 
 async def worker_loop():
     print("[init alert] Sending initialization alert")
+    # Send initialization alerts
+    init_firebase()
     send_fcm_alert("play", "Multi-Symbol CCI Alert System Initialization complete")
     await send_telegram("Multi-Symbol CCI Alert System Initialization complete")
     
+    # Start the dedicated early signal timer as a high-priority task
+    early_signal_task = asyncio.create_task(check_early_signals_periodically())
+    
     # Start a worker for each symbol
-    tasks = [asyncio.create_task(symbol_worker(symbol)) for symbol in SYMBOLS]
-    await asyncio.gather(*tasks)
+    symbol_tasks = [asyncio.create_task(symbol_worker(symbol)) for symbol in SYMBOLS]
+    
+    # Wait for all tasks. If one fails, others keep running.
+    await asyncio.gather(early_signal_task, *symbol_tasks, return_exceptions=True)
 
 # ------------- HTTP SERVER ----------------
 async def health(request):
@@ -446,7 +493,6 @@ async def health(request):
 
 async def on_startup(app):
     print("[app] starting background workers")
-    init_firebase()
     app['worker_task'] = asyncio.create_task(worker_loop())
 
 async def on_cleanup(app):
