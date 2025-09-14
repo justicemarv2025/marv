@@ -38,7 +38,7 @@ else:
 # ================== CONFIG ==================
 # CONSIDER REDUCING THIS LIST FOR BETTER PERFORMANCE ON RENDER
 SYMBOLS = [
-    "solusdt", "bchusdt", "ethusdt"
+    "ethusdt"
 ]
 
 CONFIG = {
@@ -54,7 +54,7 @@ CONFIG = {
     "print_interval_sec": 30,  # Reduced print frequency
     "close_grace_sec": 2,
     "signal_minute": 4,      # Signal at 4 minutes into the candle
-    "signal_second": 45,     # Signal at 45 seconds into the 4th minute
+    "signal_second": 35,     # Signal at 45 seconds into the 4th minute
 
     # CRITICAL PERFORMANCE SETTING: Disable to stop calculating CCI on every trade
     "use_tick_updates": False,
