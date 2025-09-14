@@ -4,6 +4,7 @@ import os
 import time
 from datetime import datetime, timezone, timedelta
 from collections import deque
+from typing import Dict, Deque, Optional
 
 import aiohttp
 from aiohttp import web
@@ -12,22 +13,17 @@ import numpy as np
 import firebase_admin
 from firebase_admin import credentials, messaging
 
-
 # ========== ENVIRONMENT SETUP ==========
-# Check if we're running in production (common hosting platforms)
 IS_PRODUCTION = os.environ.get('RENDER', False) or os.environ.get('PYTHONANYWHERE', False) or os.environ.get('HEROKU', False)
 
-# Only load .env file in local development
 if not IS_PRODUCTION:
     try:
         from dotenv import load_dotenv
-        # Try loading from .gitignore/.env first, then fall back to root .env
         env_path = None
         if os.path.exists('.gitignore/.env'):
             env_path = '.gitignore/.env'
         elif os.path.exists('.env'):
             env_path = '.env'
-        
         if env_path:
             load_dotenv(env_path)
             print(f"Loaded environment from {env_path}")
@@ -39,23 +35,28 @@ else:
     print("Running in production environment, using system environment variables")
 # =======================================
 
+# ================== CONFIG ==================
+SYMBOLS = [
+    "solusdt", "uniusdt", "linkusdt", "aaveusdt", "tonusdt",
+    "barusdt", "fetusdt", "woousdt", "bchusdt", "ethusdt"
+]
 
-
-# ================== CONFIG (defaults) ==================
 CONFIG = {
-    "symbol": "ethusdt",
+    "symbols": SYMBOLS,
     "interval": "5m",
     "bootstrap_candles": 50,
     "cci_length": 9,
     "signal_length": 9,
-    "signal_type": "sma",  # "sma" or "ema"
-    "detection_mode": "tick",  # "candle" or "tick"
+    "signal_type": "sma",
+    "detection_mode": "tick",
     "use_tick_updates": True,
     "zone_high": 95,
     "zone_low": -95,
     "min_cross_gap_minutes": 20,
     "print_interval_sec": 15,
     "close_grace_sec": 2,
+    "signal_minute": 4,      # Signal at 4 minutes into the candle
+    "signal_second": 45,     # Signal at 45 seconds into the 4th minute
 
     "alerts": {
         "telegram": True,
@@ -65,22 +66,27 @@ CONFIG = {
     },
     "alarm_file": "alarm.wav",
 
-    # TELEGRAM: read from environment for safety
     "TELEGRAM_TOKEN": os.environ.get("TELEGRAM_TOKEN", ""),
     "CHAT_ID": os.environ.get("CHAT_ID", ""),
-
-    # FCM: Firebase Cloud Messaging - will be loaded from environment
     "DEVICE_TOKENS_FILE": "device_token_lists.json"
 }
 # ============================================
 
-completed_candles = deque(maxlen=500)
-current_candle = None
-last_cross_time = None
-prev_diff = None
-signal_history = deque(maxlen=100)
-prev_signal = None
-last_print_time = 0
+# Data structures for each symbol
+symbol_data: Dict[str, Dict] = {}
+
+# Initialize data structures for each symbol
+for symbol in SYMBOLS:
+    symbol_data[symbol] = {
+        "completed_candles": deque(maxlen=500),
+        "current_candle": None,
+        "last_cross_time": None,
+        "prev_diff": None,
+        "signal_history": deque(maxlen=100),
+        "prev_signal": None,
+        "last_print_time": 0,
+        "signal_sent_this_candle": False  # Track if signal was already sent this candle
+    }
 
 # Firebase app instance
 firebase_app = None
@@ -93,23 +99,18 @@ def init_firebase():
         return
     
     try:
-        # Get Firebase credentials from environment variables
         firebase_cred_json = os.environ.get("FIREBASE_CREDENTIALS")
-        
         if not firebase_cred_json:
             print("[FCM] FIREBASE_CREDENTIALS environment variable not set")
             return
             
-        # Parse the JSON string from environment variable
         cred_dict = json.loads(firebase_cred_json)
-        
-        # Fix the private key - replace escaped newlines with actual newlines
         if 'private_key' in cred_dict:
             cred_dict['private_key'] = cred_dict['private_key'].replace('\\n', '\n')
         
         cred = credentials.Certificate(cred_dict)
         firebase_app = firebase_admin.initialize_app(cred)
-        print("[FCM] Firebase app initialized successfully from environment variables")
+        print("[FCM] Firebase app initialized successfully")
         
     except json.JSONDecodeError as e:
         print(f"[FCM] Error parsing FIREBASE_CREDENTIALS: {e}")
@@ -118,7 +119,6 @@ def init_firebase():
         firebase_app = None
 
 def load_valid_tokens():
-    """Return list of valid tokens from device_token_lists.json"""
     if not CONFIG["alerts"]["fcm"]:
         return []
     
@@ -141,19 +141,15 @@ def load_valid_tokens():
         try:
             expiry = datetime.strptime(exp, "%Y-%m-%d").date()
             if expiry >= today:
-                print(f"[FCM] valid token: {t['device_token'][:15]}... (expires {exp})")
                 valid.append({
                     "token": t["device_token"],
                     "customer": t.get("customer_name", "Unknown")
                 })
-            else:
-                print(f"[FCM] expired token: {t['device_token'][:15]}... (expired {exp})")
         except ValueError:
-            print(f"[FCM] invalid exp date for token: {t['device_token'][:15]}...")
+            continue
     return valid
 
 def send_fcm_alert(action="play", message="CCI Alert Triggered"):
-    """Send FCM alert with data payload (so Android app can handle it in foreground)"""
     if not CONFIG["alerts"]["fcm"]:
         return
     
@@ -204,11 +200,9 @@ async def send_fcm_notification(title, message):
     if not CONFIG["alerts"]["fcm"]:
         return
     
-    # Send both notification and data payload for better compatibility
     if firebase_app:
         send_fcm_alert("play", f"{title}: {message}")
     
-    # Also try the HTTP API method for broader compatibility
     token = os.environ.get("FCM_TOKEN", "")
     topic = os.environ.get("FCM_TOPIC", "cci_alerts")
     if not token:
@@ -227,27 +221,16 @@ async def send_fcm_notification(title, message):
             async with session.post(url, json=payload, headers=headers) as resp:
                 if resp.status != 200:
                     print(f"[FCM HTTP] Error {resp.status}: {await resp.text()}")
-                else:
-                    print("[FCM HTTP] Notification sent successfully")
     except Exception as e:
         print("[FCM HTTP] error", e)
 
 def play_alert():
-    if CONFIG["alerts"]["plyer"]:
+    if CONFIG["alerts"]["playfile"] and os.path.exists(CONFIG["alarm_file"]):
         try:
-            from plyer import notification
-            notification.notify(title="CCI Alert", message="Signal cross", timeout=5)
-        except Exception as e:
-            print("[plyer] error", e)
-    if CONFIG["alerts"]["playfile"]:
-        if os.path.exists(CONFIG["alarm_file"]):
-            try:
-                import playsound
-                playsound.playsound(CONFIG["alarm_file"])
-            except Exception as e:
-                print("[playfile] error", e)
-        else:
-            print(f"[warning] alarm_file '{CONFIG['alarm_file']}' not found.")
+            import playsound
+            playsound.playsound(CONFIG["alarm_file"])
+        except Exception:
+            pass
 
 # ------------- CCI CALC ----------------
 def compute_cci(candles, length=20):
@@ -270,71 +253,67 @@ def update_signal(cci_values, length, signal_type="ema"):
     if signal_type == "sma":
         return np.mean(cci_values[-length:])
     else:
-        # EMA-like weighting
         cci_array = np.array(cci_values[-length:])
         weights = np.exp(np.linspace(-1, 0, length))
         weights /= weights.sum()
         return np.dot(cci_array, weights)
 
 # ------------- ALERT CHECK ----------------
-async def check_cross():
-    global prev_diff, last_cross_time, prev_signal, signal_history
-
+async def check_cross(symbol: str):
+    data = symbol_data[symbol]
+    completed_candles = data["completed_candles"]
+    signal_history = data["signal_history"]
+    
     cci = compute_cci(list(completed_candles), CONFIG["cci_length"])
     if cci is None:
         return
+    
     signal_history.append(cci)
     signal = update_signal(list(signal_history), CONFIG["signal_length"], CONFIG["signal_type"])
     if signal is None:
         return
-    prev_signal = signal
+    
+    data["prev_signal"] = signal
 
-    global last_print_time
-    if time.time() - last_print_time > CONFIG["print_interval_sec"]:
-        print(f"[CCI] {now()} CCI={cci:.3f} Signal={signal:.3f}")
-        last_print_time = time.time()
+    if time.time() - data["last_print_time"] > CONFIG["print_interval_sec"]:
+        print(f"[CCI-{symbol.upper()}] {now()} CCI={cci:.3f} Signal={signal:.3f}")
+        data["last_print_time"] = time.time()
 
     diff = cci - signal
+    prev_diff = data["prev_diff"]
 
-    # simplified: ignore zone for testing
     crossed_up = prev_diff is not None and prev_diff < 0 and diff > 0
     crossed_down = prev_diff is not None and prev_diff > 0 and diff < 0
 
     if crossed_up or crossed_down:
         current_time = now()
-        time_since_last = current_time - last_cross_time if last_cross_time else timedelta(minutes=CONFIG["min_cross_gap_minutes"] + 1)
-        if last_cross_time is None or time_since_last > timedelta(minutes=CONFIG["min_cross_gap_minutes"]):
-            last_cross_time = current_time
+        time_since_last = current_time - data["last_cross_time"] if data["last_cross_time"] else timedelta(minutes=CONFIG["min_cross_gap_minutes"] + 1)
+        
+        if data["last_cross_time"] is None or time_since_last > timedelta(minutes=CONFIG["min_cross_gap_minutes"]):
+            data["last_cross_time"] = current_time
             direction = "UP" if crossed_up else "DOWN"
-            msg = f"🚨 CCI CROSS {direction} | CCI={cci:.2f} Signal={signal:.2f} Time={current_time}"
-            print("[alert]", msg)
+            msg = f"🚨 {symbol.upper()} CCI CROSS {direction} | CCI={cci:.2f} Signal={signal:.2f} Time={current_time}"
+            print(f"[alert-{symbol.upper()}]", msg)
             await send_telegram(msg)
-            await send_fcm_notification(f"CCI Cross {direction}", f"CCI: {cci:.2f}, Signal: {signal:.2f}")
+            await send_fcm_notification(f"{symbol.upper()} CCI Cross {direction}", f"CCI: {cci:.2f}, Signal: {signal:.2f}")
             play_alert()
 
-    prev_diff = diff
+    data["prev_diff"] = diff
 
 # ------------- DATA HANDLING ----------------
-def build_candle(kline):
-    return {
-        "open_time": int(kline[0]),
-        "open": float(kline[1]),
-        "high": float(kline[2]),
-        "low": float(kline[3]),
-        "close": float(kline[4]),
-        "volume": float(kline[5]),
-        "close_time": int(kline[6])
-    }
-
-async def bootstrap():
-    url = f"https://api.binance.com/api/v3/klines?symbol={CONFIG['symbol'].upper()}&interval={CONFIG['interval']}&limit={CONFIG['bootstrap_candles']}"
+async def bootstrap(symbol: str):
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval={CONFIG['interval']}&limit={CONFIG['bootstrap_candles']}"
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
             data = await resp.json()
+    
     if "code" in data:
-        print(f"[bootstrap] error from Binance: {data}")
+        print(f"[bootstrap-{symbol.upper()}] error from Binance: {data}")
         return
-    print(f"[bootstrap] fetched {len(data)} candles")
+    
+    completed_candles = symbol_data[symbol]["completed_candles"]
+    signal_history = symbol_data[symbol]["signal_history"]
+    
     for k in data:
         candle = {
             "open": float(k[1]),
@@ -346,87 +325,127 @@ async def bootstrap():
         cci_val = compute_cci(list(completed_candles), CONFIG["cci_length"])
         if cci_val is not None:
             signal_history.append(cci_val)
-    print(f"[bootstrap] completed_candles: {len(completed_candles)}, signal_history: {len(signal_history)}")
+    
+    print(f"[bootstrap-{symbol.upper()}] completed_candles: {len(completed_candles)}, signal_history: {len(signal_history)}")
 
-async def handle_trade(trade):
-    global current_candle
+async def handle_trade(symbol: str, trade: dict):
+    data = symbol_data[symbol]
     price = float(trade['p'])
     ts = int(trade['T'])
     dt = datetime.fromtimestamp(ts/1000, tz=timezone.utc)
     minute = dt.minute - dt.minute % 5
     candle_open = dt.replace(second=0, microsecond=0, minute=minute)
 
-    if current_candle is None or candle_open != current_candle["time"]:
-        if current_candle:
-            # close previous candle
-            completed_candles.append({
-                "open": current_candle["open"],
-                "high": current_candle["high"],
-                "low": current_candle["low"],
-                "close": current_candle["close"]
+    if data["current_candle"] is None or candle_open != data["current_candle"]["time"]:
+        # Reset signal flag for new candle
+        data["signal_sent_this_candle"] = False
+        
+        if data["current_candle"]:
+            data["completed_candles"].append({
+                "open": data["current_candle"]["open"],
+                "high": data["current_candle"]["high"],
+                "low": data["current_candle"]["low"],
+                "close": data["current_candle"]["close"]
             })
-            print(f"[candle] closed {current_candle['time']} o:{current_candle['open']} h:{current_candle['high']} l:{current_candle['low']} c:{current_candle['close']}")
-            await check_cross()
-        current_candle = {"time": candle_open, "open": price, "high": price, "low": price, "close": price}
-        print(f"[candle] opened new candle at {candle_open}")
+            print(f"[candle-{symbol.upper()}] closed {data['current_candle']['time']}")
+            await check_cross(symbol)
+        
+        data["current_candle"] = {"time": candle_open, "open": price, "high": price, "low": price, "close": price}
+        print(f"[candle-{symbol.upper()}] opened new candle at {candle_open}")
     else:
-        current_candle["close"] = price
-        current_candle["high"] = max(current_candle["high"], price)
-        current_candle["low"] = min(current_candle["low"], price)
+        data["current_candle"]["close"] = price
+        data["current_candle"]["high"] = max(data["current_candle"]["high"], price)
+        data["current_candle"]["low"] = min(data["current_candle"]["low"], price)
+
+    # Check if it's time to send signal (4 minutes 45 seconds into the candle)
+    current_time = now()
+    candle_start = data["current_candle"]["time"]
+    time_in_candle = current_time - candle_start
+    
+    # Check if we're at the right time in the candle and haven't sent a signal yet
+    if (time_in_candle.total_seconds() >= CONFIG["signal_minute"] * 60 + CONFIG["signal_second"] and 
+        not data["signal_sent_this_candle"]):
+        
+        # Create temporary candle set including current incomplete candle
+        tmp_candles = list(data["completed_candles"]) + [{
+            "open": data["current_candle"]["open"],
+            "high": data["current_candle"]["high"],
+            "low": data["current_candle"]["low"],
+            "close": data["current_candle"]["close"]
+        }]
+        
+        # Calculate CCI and signal
+        cci = compute_cci(tmp_candles, CONFIG["cci_length"])
+        if cci:
+            tmp_signal_history = list(data["signal_history"]) + [cci]
+            signal = update_signal(tmp_signal_history, CONFIG["signal_length"], CONFIG["signal_type"])
+            
+            if signal:
+                # Send signal notification
+                direction = "LONG" if cci > signal else "SHORT"
+                msg = f"📊 {symbol.upper()} SIGNAL | {direction} | CCI={cci:.2f} Signal={signal:.2f} Time={current_time}"
+                print(f"[signal-{symbol.upper()}]", msg)
+                await send_telegram(msg)
+                await send_fcm_notification(f"{symbol.upper()} Signal {direction}", f"CCI: {cci:.2f}, Signal: {signal:.2f}")
+                
+                # Mark signal as sent for this candle
+                data["signal_sent_this_candle"] = True
 
     if CONFIG["use_tick_updates"]:
-        tmp_candles = list(completed_candles) + [{
-            "open": current_candle["open"],
-            "high": current_candle["high"],
-            "low": current_candle["low"],
-            "close": current_candle["close"]
+        tmp_candles = list(data["completed_candles"]) + [{
+            "open": data["current_candle"]["open"],
+            "high": data["current_candle"]["high"],
+            "low": data["current_candle"]["low"],
+            "close": data["current_candle"]["close"]
         }]
         cci = compute_cci(tmp_candles, CONFIG["cci_length"])
         if cci:
-            tmp_signal_history = list(signal_history) + [cci]
+            tmp_signal_history = list(data["signal_history"]) + [cci]
             signal = update_signal(tmp_signal_history, CONFIG["signal_length"], CONFIG["signal_type"])
             if signal:
-                print(f"[tick] price={price:.2f} CCI={cci:.2f} Signal={signal:.2f} Diff={cci-signal:.2f}")
+                print(f"[tick-{symbol.upper()}] price={price:.2f} CCI={cci:.2f} Signal={signal:.2f}")
 
-# ------------- MAIN (background worker) ----------------
-async def ws_loop():
-    url = f"wss://stream.binance.com:9443/ws/{CONFIG['symbol']}@trade"
+# ------------- WEBSOCKET HANDLING ----------------
+async def ws_loop(symbol: str):
+    url = f"wss://stream.binance.com:9443/ws/{symbol}@trade"
     async with websockets.connect(url) as ws:
-        print(f"[ws] connected to {url}")
+        print(f"[ws-{symbol.upper()}] connected to {url}")
         async for msg in ws:
             data = json.loads(msg)
-            print(f"[ws] received trade: {data['p']} at {datetime.fromtimestamp(data['T']/1000, tz=timezone.utc)}")
-            await handle_trade(data)
+            await handle_trade(symbol, data)
 
-async def worker_loop():
-    # Send initialization alert
-    print("[init alert] Sending initialization alert")
-    send_fcm_alert("play", "CCI Alert System Initialization complete")
-    await send_telegram("CCI Alert System Initialization complete")
-    
-    await bootstrap()
+async def symbol_worker(symbol: str):
+    await bootstrap(symbol)
     while True:
         try:
-            await ws_loop()
+            await ws_loop(symbol)
         except asyncio.CancelledError:
-            print("[worker] cancelled")
+            print(f"[worker-{symbol.upper()}] cancelled")
             break
         except Exception as e:
-            print("[ws] error", e)
+            print(f"[ws-{symbol.upper()}] error: {e}")
             await asyncio.sleep(5)
 
-# ------------- SIMPLE HTTP SERVER (for health checks / keepalive) -------------
+async def worker_loop():
+    print("[init alert] Sending initialization alert")
+    send_fcm_alert("play", "Multi-Symbol CCI Alert System Initialization complete")
+    await send_telegram("Multi-Symbol CCI Alert System Initialization complete")
+    
+    # Start a worker for each symbol
+    tasks = [asyncio.create_task(symbol_worker(symbol)) for symbol in SYMBOLS]
+    await asyncio.gather(*tasks)
+
+# ------------- HTTP SERVER ----------------
 async def health(request):
-    return web.Response(text="OK")
+    return web.Response(text="Multi-Symbol CCI Alert System OK")
 
 async def on_startup(app):
-    print("[app] starting background worker")
-    # Initialize Firebase
+    print("[app] starting background workers")
     init_firebase()
     app['worker_task'] = asyncio.create_task(worker_loop())
 
 async def on_cleanup(app):
-    print("[app] stopping background worker")
+    print("[app] stopping background workers")
     task = app.get('worker_task')
     if task:
         task.cancel()
@@ -443,6 +462,6 @@ def create_app():
     return app
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", 10000))  # Changed to 10000 to avoid conflict
     app = create_app()
     web.run_app(app, host="0.0.0.0", port=port)
