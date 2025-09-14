@@ -85,7 +85,8 @@ for symbol in SYMBOLS:
         "signal_history": deque(maxlen=100),
         "prev_signal": None,
         "last_print_time": 0,
-        "signal_sent_this_candle": False  # Track if signal was already sent this candle
+        "signal_sent_this_candle": False,  # Track if signal was already sent this candle
+        "prev_diff_early": None  # Track previous diff for early crossover detection
     }
 
 # Firebase app instance
@@ -259,28 +260,49 @@ def update_signal(cci_values, length, signal_type="ema"):
         return np.dot(cci_array, weights)
 
 # ------------- ALERT CHECK ----------------
-async def check_cross(symbol: str):
+async def check_cross(symbol: str, use_early_detection=False):
     data = symbol_data[symbol]
     completed_candles = data["completed_candles"]
     signal_history = data["signal_history"]
     
-    cci = compute_cci(list(completed_candles), CONFIG["cci_length"])
-    if cci is None:
-        return
+    # For early detection, include the current candle
+    if use_early_detection:
+        tmp_candles = list(completed_candles) + [{
+            "open": data["current_candle"]["open"],
+            "high": data["current_candle"]["high"],
+            "low": data["current_candle"]["low"],
+            "close": data["current_candle"]["close"]
+        }]
+        cci = compute_cci(tmp_candles, CONFIG["cci_length"])
+        if cci is None:
+            return
+        
+        tmp_signal_history = list(signal_history) + [cci]
+        signal = update_signal(tmp_signal_history, CONFIG["signal_length"], CONFIG["signal_type"])
+    else:
+        # Standard detection using only completed candles
+        cci = compute_cci(list(completed_candles), CONFIG["cci_length"])
+        if cci is None:
+            return
+        
+        signal_history.append(cci)
+        signal = update_signal(list(signal_history), CONFIG["signal_length"], CONFIG["signal_type"])
     
-    signal_history.append(cci)
-    signal = update_signal(list(signal_history), CONFIG["signal_length"], CONFIG["signal_type"])
     if signal is None:
         return
     
-    data["prev_signal"] = signal
+    if use_early_detection:
+        data_key = "prev_diff_early"
+    else:
+        data_key = "prev_diff"
+        data["prev_signal"] = signal
 
     if time.time() - data["last_print_time"] > CONFIG["print_interval_sec"]:
         print(f"[CCI-{symbol.upper()}] {now()} CCI={cci:.3f} Signal={signal:.3f}")
         data["last_print_time"] = time.time()
 
     diff = cci - signal
-    prev_diff = data["prev_diff"]
+    prev_diff = data[data_key]
 
     crossed_up = prev_diff is not None and prev_diff < 0 and diff > 0
     crossed_down = prev_diff is not None and prev_diff > 0 and diff < 0
@@ -292,13 +314,18 @@ async def check_cross(symbol: str):
         if data["last_cross_time"] is None or time_since_last > timedelta(minutes=CONFIG["min_cross_gap_minutes"]):
             data["last_cross_time"] = current_time
             direction = "UP" if crossed_up else "DOWN"
-            msg = f"🚨 {symbol.upper()} CCI CROSS {direction} | CCI={cci:.2f} Signal={signal:.2f} Time={current_time}"
+            detection_type = "EARLY" if use_early_detection else "FINAL"
+            msg = f"🚨 {symbol.upper()} CCI CROSS {direction} ({detection_type}) | CCI={cci:.2f} Signal={signal:.2f} Time={current_time}"
             print(f"[alert-{symbol.upper()}]", msg)
             await send_telegram(msg)
             await send_fcm_notification(f"{symbol.upper()} CCI Cross {direction}", f"CCI: {cci:.2f}, Signal: {signal:.2f}")
             play_alert()
+            
+            # Mark signal as sent for this candle if it's an early detection
+            if use_early_detection:
+                data["signal_sent_this_candle"] = True
 
-    data["prev_diff"] = diff
+    data[data_key] = diff
 
 # ------------- DATA HANDLING ----------------
 async def bootstrap(symbol: str):
@@ -339,6 +366,7 @@ async def handle_trade(symbol: str, trade: dict):
     if data["current_candle"] is None or candle_open != data["current_candle"]["time"]:
         # Reset signal flag for new candle
         data["signal_sent_this_candle"] = False
+        data["prev_diff_early"] = None
         
         if data["current_candle"]:
             data["completed_candles"].append({
@@ -348,7 +376,7 @@ async def handle_trade(symbol: str, trade: dict):
                 "close": data["current_candle"]["close"]
             })
             print(f"[candle-{symbol.upper()}] closed {data['current_candle']['time']}")
-            await check_cross(symbol)
+            await check_cross(symbol, use_early_detection=False)
         
         data["current_candle"] = {"time": candle_open, "open": price, "high": price, "low": price, "close": price}
         print(f"[candle-{symbol.upper()}] opened new candle at {candle_open}")
@@ -357,7 +385,7 @@ async def handle_trade(symbol: str, trade: dict):
         data["current_candle"]["high"] = max(data["current_candle"]["high"], price)
         data["current_candle"]["low"] = min(data["current_candle"]["low"], price)
 
-    # Check if it's time to send signal (4 minutes 45 seconds into the candle)
+    # Check if it's time to check for early crossover (4 minutes 45 seconds into the candle)
     current_time = now()
     candle_start = data["current_candle"]["time"]
     time_in_candle = current_time - candle_start
@@ -366,30 +394,8 @@ async def handle_trade(symbol: str, trade: dict):
     if (time_in_candle.total_seconds() >= CONFIG["signal_minute"] * 60 + CONFIG["signal_second"] and 
         not data["signal_sent_this_candle"]):
         
-        # Create temporary candle set including current incomplete candle
-        tmp_candles = list(data["completed_candles"]) + [{
-            "open": data["current_candle"]["open"],
-            "high": data["current_candle"]["high"],
-            "low": data["current_candle"]["low"],
-            "close": data["current_candle"]["close"]
-        }]
-        
-        # Calculate CCI and signal
-        cci = compute_cci(tmp_candles, CONFIG["cci_length"])
-        if cci:
-            tmp_signal_history = list(data["signal_history"]) + [cci]
-            signal = update_signal(tmp_signal_history, CONFIG["signal_length"], CONFIG["signal_type"])
-            
-            if signal:
-                # Send signal notification
-                direction = "LONG" if cci > signal else "SHORT"
-                msg = f"📊 {symbol.upper()} SIGNAL | {direction} | CCI={cci:.2f} Signal={signal:.2f} Time={current_time}"
-                print(f"[signal-{symbol.upper()}]", msg)
-                await send_telegram(msg)
-                await send_fcm_notification(f"{symbol.upper()} Signal {direction}", f"CCI: {cci:.2f}, Signal: {signal:.2f}")
-                
-                # Mark signal as sent for this candle
-                data["signal_sent_this_candle"] = True
+        # Check for crossover using current incomplete candle data
+        await check_cross(symbol, use_early_detection=True)
 
     if CONFIG["use_tick_updates"]:
         tmp_candles = list(data["completed_candles"]) + [{
@@ -462,6 +468,6 @@ def create_app():
     return app
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))  # Changed to 10000 to avoid conflict
+    port = int(os.environ.get("PORT", 10000))
     app = create_app()
     web.run_app(app, host="0.0.0.0", port=port)
