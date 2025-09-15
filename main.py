@@ -36,7 +36,6 @@ else:
 # =======================================
 
 # ================== CONFIG ==================
-# CONSIDER REDUCING THIS LIST FOR BETTER PERFORMANCE ON RENDER
 SYMBOLS = [
     "ethusdt"
 ]
@@ -51,18 +50,17 @@ CONFIG = {
     "zone_high": 95,
     "zone_low": -95,
     "min_cross_gap_minutes": 20,
-    "print_interval_sec": 30,  # Reduced print frequency
+    "print_interval_sec": 30,
     "close_grace_sec": 2,
-    "signal_minute": 4,      # Signal at 4 minutes into the candle
-    "signal_second": 35,     # Signal at 45 seconds into the 4th minute
+    "signal_minute": 4,
+    "signal_second": 35,
 
-    # CRITICAL PERFORMANCE SETTING: Disable to stop calculating CCI on every trade
     "use_tick_updates": False,
 
     "alerts": {
         "telegram": True,
-        "playfile": False,    # Disabled on server
-        "plyer": False,       # Disabled on server
+        "playfile": False,
+        "plyer": False,
         "fcm": True
     },
     "alarm_file": "alarm.wav",
@@ -86,9 +84,9 @@ for symbol in SYMBOLS:
         "signal_history": deque(maxlen=100),
         "prev_signal": None,
         "last_print_time": 0,
-        "signal_sent_this_candle": False,  # Track if signal was already sent this candle
-        "prev_diff_early": None,  # Track previous diff for early crossover detection
-        "last_early_check_time": 0 # Track the last time we did an early check for this symbol
+        "signal_sent_this_candle": False,
+        "prev_diff_early": None,
+        "last_early_check_time": 0
     }
 
 # Firebase app instance
@@ -152,7 +150,7 @@ def load_valid_tokens():
             continue
     return valid
 
-def send_fcm_alert(action="play", message="CCI Alert Triggered"):
+def send_fcm_alert(sound_type="up", message="CCI Alert Triggered"):
     if not CONFIG["alerts"]["fcm"]:
         return
     
@@ -169,7 +167,8 @@ def send_fcm_alert(action="play", message="CCI Alert Triggered"):
         try:
             msg = messaging.Message(
                 data={
-                    "action": action,
+                    "action": "play",
+                    "soundType": sound_type,
                     "timestamp": datetime.now().isoformat(),
                     "message": message
                 },
@@ -199,12 +198,12 @@ async def send_telegram(msg):
     except Exception as e:
         print("[telegram] error", e)
 
-async def send_fcm_notification(title, message):
+async def send_fcm_notification(title, message, sound_type):
     if not CONFIG["alerts"]["fcm"]:
         return
     
     if firebase_app:
-        send_fcm_alert("play", f"{title}: {message}")
+        send_fcm_alert(sound_type, f"{title}: {message}")
     
     token = os.environ.get("FCM_TOKEN", "")
     topic = os.environ.get("FCM_TOPIC", "cci_alerts")
@@ -217,7 +216,13 @@ async def send_fcm_notification(title, message):
     payload = {
         "to": f"/topics/{topic}",
         "notification": {"title": title, "body": message, "sound": "default"},
-        "data": {"title": title, "message": message, "timestamp": datetime.now().isoformat()}
+        "data": {
+            "title": title, 
+            "message": message, 
+            "timestamp": datetime.now().isoformat(),
+            "action": "play",
+            "soundType": sound_type
+        }
     }
     try:
         async with aiohttp.ClientSession() as session:
@@ -228,7 +233,6 @@ async def send_fcm_notification(title, message):
         print("[FCM HTTP] error", e)
 
 def play_alert():
-    # Disabled on server
     pass
 
 # ------------- CCI CALC ----------------
@@ -314,11 +318,12 @@ async def check_cross(symbol: str, use_early_detection=False):
         if data["last_cross_time"] is None or time_since_last > timedelta(minutes=CONFIG["min_cross_gap_minutes"]):
             data["last_cross_time"] = current_time
             direction = "UP" if crossed_up else "DOWN"
+            sound_type = "up" if crossed_up else "down"
             detection_type = "EARLY" if use_early_detection else "FINAL"
             msg = f"🚨 {symbol.upper()} CCI CROSS {direction} ({detection_type}) | CCI={cci:.2f} Signal={signal:.2f} Time={current_time}"
             print(f"[alert-{symbol.upper()}]", msg)
             await send_telegram(msg)
-            await send_fcm_notification(f"{symbol.upper()} CCI Cross {direction}", f"CCI: {cci:.2f}, Signal: {signal:.2f}")
+            await send_fcm_notification(f"{symbol.upper()} CCI Cross {direction}", f"CCI: {cci:.2f}, Signal: {signal:.2f}", sound_type)
             
             # Mark signal as sent for this candle if it's an early detection
             if use_early_detection:
@@ -393,7 +398,6 @@ async def handle_trade(symbol: str, trade: dict):
         data["current_candle"]["high"] = max(data["current_candle"]["high"], price)
         data["current_candle"]["low"] = min(data["current_candle"]["low"], price)
 
-    # PERFORMANCE CRITICAL: Only calculate on tick if explicitly enabled (NOT recommended)
     if CONFIG["use_tick_updates"]:
         tmp_candles = list(data["completed_candles"]) + [{
             "open": data["current_candle"]["open"],
@@ -406,40 +410,28 @@ async def handle_trade(symbol: str, trade: dict):
             tmp_signal_history = list(data["signal_history"]) + [cci]
             signal = update_signal(tmp_signal_history, CONFIG["signal_length"], CONFIG["signal_type"])
             if signal:
-                # Comment out this print to save CPU
-                # print(f"[tick-{symbol.upper()}] price={price:.2f} CCI={cci:.2f} Signal={signal:.2f}")
                 pass
 
 # ------------- DEDICATED EARLY SIGNAL TIMER ----------------
 async def check_early_signals_periodically():
-    """
-    A dedicated task that runs every second to check if it's time for an early signal.
-    This prevents the check from being blocked by trade processing.
-    """
     print("[Early Signal Timer] Started dedicated early signal timer task.")
     while True:
         current_utc_time = now()
-        # Check every second for high precision
         await asyncio.sleep(1)
 
         for symbol in CONFIG['symbols']:
             data = symbol_data[symbol]
-            # If there's no current candle, skip
             if data["current_candle"] is None:
                 continue
 
-            # Check if we've already sent a signal for this candle
             if data["signal_sent_this_candle"]:
                 continue
 
             candle_start = data["current_candle"]["time"]
-            # Check if we are past the early signal time for this candle
             time_in_candle = current_utc_time - candle_start
             target_time_sec = (CONFIG["signal_minute"] * 60) + CONFIG["signal_second"]
 
-            # Check if we are in the target second
             if time_in_candle.total_seconds() >= target_time_sec:
-                # Check if we already did the check this second (avoid duplicates)
                 if time.time() - data["last_early_check_time"] > 0.5:
                     print(f"[{symbol.upper()}] ⌛ PERIODIC CHECK: Triggering early signal at {current_utc_time} ({time_in_candle.total_seconds():.1f}s into candle)")
                     await check_cross(symbol, use_early_detection=True)
@@ -453,7 +445,7 @@ async def ws_loop(symbol: str):
         try:
             async with websockets.connect(url) as ws:
                 print(f"[ws-{symbol.upper()}] connected to {url}")
-                retry_count = 0 # Reset retry count on successful connection
+                retry_count = 0
                 async for msg in ws:
                     data = json.loads(msg)
                     await handle_trade(symbol, data)
@@ -462,7 +454,7 @@ async def ws_loop(symbol: str):
             break
         except Exception as e:
             retry_count += 1
-            wait_time = min(2 ** retry_count, 30) # Exponential backoff, max 30 sec
+            wait_time = min(2 ** retry_count, 30)
             print(f"[ws-{symbol.upper()}] error (Attempt {retry_count}/{max_retries}): {e}. Retrying in {wait_time}s...")
             await asyncio.sleep(wait_time)
     print(f"[ws-{symbol.upper()}] Failed to connect after {max_retries} attempts. Stopping.")
@@ -473,18 +465,14 @@ async def symbol_worker(symbol: str):
 
 async def worker_loop():
     print("[init alert] Sending initialization alert")
-    # Send initialization alerts
     init_firebase()
-    send_fcm_alert("play", "Multi-Symbol CCI Alert System Initialization complete")
+    send_fcm_alert("up", "Multi-Symbol CCI Alert System Initialization complete")
     await send_telegram("Multi-Symbol CCI Alert System Initialization complete")
     
-    # Start the dedicated early signal timer as a high-priority task
     early_signal_task = asyncio.create_task(check_early_signals_periodically())
     
-    # Start a worker for each symbol
     symbol_tasks = [asyncio.create_task(symbol_worker(symbol)) for symbol in SYMBOLS]
     
-    # Wait for all tasks. If one fails, others keep running.
     await asyncio.gather(early_signal_task, *symbol_tasks, return_exceptions=True)
 
 # ------------- HTTP SERVER ----------------
