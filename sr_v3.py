@@ -26,12 +26,12 @@ else:
 # ================== CONFIG ==================
 CONFIG = {
     "symbols": ["ethusdt"],
-    "timeframes": ["5m", "15m", "30m"],
+    "timeframes": ["15m", "30m", "60m"],
     "pivot_lookback_periods": 5,
     "strength_threshold": 2,
     "zone_width_percent": 0.002,
     "min_distance_percent": 0.005,
-    "cooldown_minutes": {"5m": 25, "15m": 45, "30m": 90},
+    "cooldown_minutes": {"15m": 45, "30m": 90, "60m": 90},
     "levels_to_track": 3,
     "volume_weight": 0.3,
     "recent_weight": 0.7,
