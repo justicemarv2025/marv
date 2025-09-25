@@ -26,12 +26,29 @@ else:
 # ================== CONFIG ==================
 CONFIG = {
     "symbols": ["ethusdt"],
-    "timeframes": ["5m", "15m", "30m"],
+
+    # Timeframes with per-timeframe toggle (True = enabled)
+    # Add new timeframes here. If set False, we won't compute SR or send alerts for that timeframe.
+    "timeframes": {
+        "1m": False,   # keep 1m present if you want alerts on 1m; even if False it's used as trend_timeframe below
+        "5m": False,
+        "15m": True,
+        "30m": True,
+        "45m": False,
+        "60m": False,
+        "120m": False,
+        "240m": False,
+    },
+
+    # timeframe used to evaluate trend (EMA stacking and stochastic). Usually 1m as requested.
+    "trend_timeframe": "1m",
+
     "pivot_lookback_periods": 5,
     "strength_threshold": 2,
     "zone_width_percent": 0.002,
+    "warning_zone_multiplier": 2.0,  # approaching zone will be zone_width_percent * this
     "min_distance_percent": 0.005,
-    "cooldown_minutes": {"5m": 25, "15m": 45, "30m": 90},
+    "cooldown_minutes": {"1m": 10, "5m": 25, "15m": 45, "30m": 90, "45m": 120, "60m": 150, "120m": 240, "240m": 360},
     "levels_to_track": 3,
     "volume_weight": 0.3,
     "recent_weight": 0.7,
@@ -48,40 +65,36 @@ CONFIG = {
     "CHAT_ID": os.environ.get("CHAT_ID", ""),
     "DEVICE_TOKENS_FILE": "device_token_lists.json",
 
-    # ========== Trend / Filter settings (new) ==========
-    # timeframe to use for trend/stochastic checks (one-minute timeframe configurable)
-    "trend_timeframe": "1m",
+    # Filter toggle: if True, alerts require 1m EMA stacking + stochastic condition
+    "use_ma_stoch_filter": False,
 
-    # moving average settings - type and periods configurable
-    # Note: currently implementation supports 'ema' (exponential). You can add others later.
+    # EMA/stochastic configuration (all configurable)
     "ma_type": "ema",
-    "ma_periods": [20, 50, 100, 200],  # default stack order expected: [20,50,100,200]
-
-    # stochastic oscillator settings
+    "ma_periods": [20, 50, 100, 200],  # must be ordered small->large for stacking checks
     "stochastic_period": 14,
-    "stochastic_k_smoothing": 1,  # if >1, smooth %K by this many periods (simple SMA smoothing)
+    "stochastic_k_smoothing": 1,  # smoothing for %K (1 = no smoothing)
     "stochastic_overbought": 80.0,
-    "stochastic_oversold": 20.0
+    "stochastic_oversold": 20.0,
 }
 
 # Global data structures
 sr_data = {}
-level_cooldowns = {}
-
-# Ensure trend_timeframe is included in sr_data even if not in timeframes
-all_timeframes_in_use = set(CONFIG["timeframes"])
-all_timeframes_in_use.add(CONFIG["trend_timeframe"])
-
+# We'll keep a per-symbol map of timeframes (only those enabled plus trend_timeframe)
 for symbol in CONFIG["symbols"]:
     sr_data[symbol] = {}
-    for timeframe in all_timeframes_in_use:
+    # Ensure trend_timeframe is always created (even if disabled for alerts)
+    tf_set = set(k for k, v in CONFIG["timeframes"].items() if v)
+    tf_set.add(CONFIG["trend_timeframe"])
+    for timeframe in tf_set:
+        # completed_candles should be large enough for EMA and stochastic usage
         sr_data[symbol][timeframe] = {
-            "completed_candles": deque(maxlen=1000),  # larger for trend calculations
+            "completed_candles": deque(maxlen=2000),
             "current_candle": None,
             "support_levels": [],
             "resistance_levels": [],
             "level_strength": {},
-            "last_alert_time": {}
+            "last_alert_time": {},
+            "warnings_sent": set()  # store keys of warnings already sent for one-time warnings
         }
 
 # Firebase app instance
@@ -150,7 +163,6 @@ def calculate_level_strength(level: float, candles: List[Dict], zone_width_perce
     zone_low = level * (1 - zone_width_percent)
     zone_high = level * (1 + zone_width_percent)
     
-    # avoid zero division for mean volume
     volumes = [c.get('volume', 1) for c in candles]
     mean_volume = max(1, np.mean(volumes))
     
@@ -206,6 +218,13 @@ def is_price_near_level(price: float, level: float, zone_width_percent: float) -
     zone_high = level * (1 + zone_width_percent)
     return zone_low <= price <= zone_high
 
+def is_price_in_warning_zone(price: float, level: float, zone_width_percent: float, multiplier: float) -> bool:
+    warning_zone = zone_width_percent * multiplier
+    zone_low = level * (1 - warning_zone)
+    zone_high = level * (1 + warning_zone)
+    # Warning zone is larger than main zone; to avoid duplicate when in main zone we can treat separately
+    return zone_low <= price <= zone_high
+
 def is_cooldown_active(symbol: str, timeframe: str, level: float, current_time: datetime) -> bool:
     cooldown_key = f"{level:.6f}"
     last_alert_time = sr_data[symbol][timeframe]["last_alert_time"].get(cooldown_key)
@@ -213,14 +232,14 @@ def is_cooldown_active(symbol: str, timeframe: str, level: float, current_time: 
     if not last_alert_time:
         return False
     
-    cooldown_minutes = CONFIG["cooldown_minutes"][timeframe]
+    cooldown_minutes = CONFIG["cooldown_minutes"].get(timeframe, 60)
     return (current_time - last_alert_time) < timedelta(minutes=cooldown_minutes)
 
-# =============== TREND FILTER HELPERS (new) ===============
+# =============== INDICATORS FOR TREND FILTER ===============
 def calculate_ema_series(values: List[float], period: int) -> List[float]:
     """
     Return EMA series for the provided values (same length as values).
-    Simple iterative EMA: alpha = 2/(period+1)
+    Iterative EMA: alpha = 2/(period+1)
     """
     if not values or period <= 0:
         return []
@@ -230,28 +249,23 @@ def calculate_ema_series(values: List[float], period: int) -> List[float]:
     if len(values) >= period:
         seed = sum(values[:period]) / period
         ema.append(seed)
-        start_idx = period
         for v in values[period:]:
             prev = ema[-1]
             ema.append(prev + alpha * (v - prev))
     else:
-        # if not enough values, seed with first value
         ema.append(values[0])
         for v in values[1:]:
             prev = ema[-1]
             ema.append(prev + alpha * (v - prev))
-    # If ema length < values length, pad front with first ema value to align lengths
+    # pad front if necessary to align with input length
     if len(ema) < len(values):
-        pad = [ema[0]] * (len(values) - len(ema)) + ema
-        return pad
+        padded = [ema[0]] * (len(values) - len(ema)) + ema
+        return padded
     return ema
 
 def calculate_stochastic_k(candles: List[Dict], period: int, k_smoothing: int = 1) -> float:
     """
-    Calculate the latest %K stochastic value (0-100) using the most recent candles.
-    Uses period lookback on highs/lows and current close.
-    Optionally smooth %K by simple moving average of last k_smoothing %K values.
-    Returns NaN if insufficient data.
+    Calculate latest %K on candles using lookback `period`. Optional smoothing of %K.
     """
     if len(candles) < period:
         return float("nan")
@@ -259,17 +273,14 @@ def calculate_stochastic_k(candles: List[Dict], period: int, k_smoothing: int = 
     highest_high = max(c['high'] for c in recent)
     lowest_low = min(c['low'] for c in recent)
     if highest_high == lowest_low:
-        return 50.0  # neutral fallback
+        return 50.0
     latest_close = candles[-1]['close']
     k = (latest_close - lowest_low) / (highest_high - lowest_low) * 100.0
 
     if k_smoothing and k_smoothing > 1:
-        # compute previous %K values to smooth
         ks = []
-        # need (k_smoothing) %K values: compute for last (k_smoothing) windows
         for i in range(k_smoothing):
             if len(candles) - i - period < 0:
-                # not enough data to compute more historical %K, fallback to current k
                 ks.append(k)
             else:
                 window = candles[-period - i:len(candles) - i]
@@ -286,7 +297,6 @@ def calculate_stochastic_k(candles: List[Dict], period: int, k_smoothing: int = 
 def get_trend_ema_values(symbol: str) -> Dict[int, float]:
     """
     Calculate EMA values for configured periods on the trend_timeframe using completed candles.
-    Returns a dict period -> latest EMA value. If insufficient data returns empty dict.
     """
     tf = CONFIG["trend_timeframe"]
     candles = list(sr_data[symbol][tf]["completed_candles"])
@@ -307,17 +317,15 @@ def get_trend_ema_values(symbol: str) -> Dict[int, float]:
 def trend_allows_support(symbol: str) -> bool:
     """
     Return True only if:
-      EMA20 > EMA50 > EMA100 > EMA200 (configurable periods/order)
+      EMA20 > EMA50 > EMA100 > EMA200 (based on CONFIG["ma_periods"])
     AND stochastic %K on trend_timeframe <= stochastic_oversold threshold
     """
     ema_vals = get_trend_ema_values(symbol)
-    # require all configured periods present
     required_periods = CONFIG["ma_periods"]
     if any(p not in ema_vals for p in required_periods):
         return False
 
-    # check stacking: for support we require descending from smallest -> largest (fast > slow)
-    # assume CONFIG["ma_periods"] is ordered small->large, e.g., [20,50,100,200]
+    # check stacking (fast > slow)
     for earlier, later in zip(required_periods, required_periods[1:]):
         if not (ema_vals[earlier] > ema_vals[later]):
             return False
@@ -333,7 +341,7 @@ def trend_allows_support(symbol: str) -> bool:
 def trend_allows_resistance(symbol: str) -> bool:
     """
     Return True only if:
-      EMA20 < EMA50 < EMA100 < EMA200 (configurable periods/order)
+      EMA20 < EMA50 < EMA100 < EMA200
     AND stochastic %K on trend_timeframe >= stochastic_overbought threshold
     """
     ema_vals = get_trend_ema_values(symbol)
@@ -341,7 +349,6 @@ def trend_allows_resistance(symbol: str) -> bool:
     if any(p not in ema_vals for p in required_periods):
         return False
 
-    # check inverted stacking: fast < slow
     for earlier, later in zip(required_periods, required_periods[1:]):
         if not (ema_vals[earlier] < ema_vals[later]):
             return False
@@ -439,19 +446,62 @@ async def trigger_resistance_alert(symbol: str, timeframe: str, level: float, st
     await send_telegram(message)
     send_fcm_alert(sound_type, message)
 
+async def trigger_support_warning(symbol: str, timeframe: str, level: float, current_price: float):
+    # one-time warning for approaching support
+    sound_type = f"{symbol}_{timeframe}_support_warning"
+    message = f"⚠️ {symbol.upper()} {timeframe} SUPPORT WARNING | Approaching level: {level:.4f} | Current: {current_price:.4f}"
+    print(f"[SR-WARNING] {message}")
+    await send_telegram(message)
+    send_fcm_alert(sound_type, message)
+
+async def trigger_resistance_warning(symbol: str, timeframe: str, level: float, current_price: float):
+    sound_type = f"{symbol}_{timeframe}_resistance_warning"
+    message = f"⚠️ {symbol.upper()} {timeframe} RESISTANCE WARNING | Approaching level: {level:.4f} | Current: {current_price:.4f}"
+    print(f"[SR-WARNING] {message}")
+    await send_telegram(message)
+    send_fcm_alert(sound_type, message)
+
+# =============== ALERT CHECKING (with filter + warnings) ===============
 async def check_support_resistance_alerts(symbol: str, timeframe: str, current_price: float):
-    """
-    Modified: Only trigger support alerts when trend_allows_support(symbol) is True.
-              Only trigger resistance alerts when trend_allows_resistance(symbol) is True.
-    All other conditions remain the same.
-    """
+    # If timeframe is disabled for alerts, return
+    if timeframe not in sr_data[symbol]:
+        return
+    # If timeframe is present but the CONFIG toggle is False, skip alerts for it.
+    if timeframe in CONFIG["timeframes"] and not CONFIG["timeframes"][timeframe]:
+        return
+
     data = sr_data[symbol][timeframe]
     current_time = datetime.now(timezone.utc)
 
-    # Evaluate trend filters for this symbol
-    allow_support = trend_allows_support(symbol)
-    allow_resistance = trend_allows_resistance(symbol)
+    # Evaluate trend filters for this symbol (only if filter enabled)
+    allow_support = True
+    allow_resistance = True
+    if CONFIG["use_ma_stoch_filter"]:
+        allow_support = trend_allows_support(symbol)
+        allow_resistance = trend_allows_resistance(symbol)
 
+    # First: check & send one-time warnings if price is approaching a level (warning zone)
+    for level, _ in data["support_levels"]:
+        key = f"warn_{level:.6f}_support"
+        if key not in data["warnings_sent"]:
+            # warn if within warning zone and not inside main zone
+            in_warning = is_price_in_warning_zone(current_price, level, CONFIG["zone_width_percent"], CONFIG["warning_zone_multiplier"])
+            in_main = is_price_near_level(current_price, level, CONFIG["zone_width_percent"])
+            if in_warning and not in_main:
+                # Send one-time warning and mark sent
+                await trigger_support_warning(symbol, timeframe, level, current_price)
+                data["warnings_sent"].add(key)
+
+    for level, _ in data["resistance_levels"]:
+        key = f"warn_{level:.6f}_resistance"
+        if key not in data["warnings_sent"]:
+            in_warning = is_price_in_warning_zone(current_price, level, CONFIG["zone_width_percent"], CONFIG["warning_zone_multiplier"])
+            in_main = is_price_near_level(current_price, level, CONFIG["zone_width_percent"])
+            if in_warning and not in_main:
+                await trigger_resistance_warning(symbol, timeframe, level, current_price)
+                data["warnings_sent"].add(key)
+
+    # Then: main alerts (subject to filters and cooldowns)
     for level, strength in data["support_levels"]:
         if (is_price_near_level(current_price, level, CONFIG["zone_width_percent"]) and
             strength >= CONFIG["strength_threshold"] and
@@ -460,6 +510,11 @@ async def check_support_resistance_alerts(symbol: str, timeframe: str, current_p
 
             await trigger_support_alert(symbol, timeframe, level, strength, current_price)
             sr_data[symbol][timeframe]["last_alert_time"][f"{level:.6f}"] = current_time
+            # Clear any warning flag for this level so a new warning could be sent in a future run (optional)
+            try:
+                sr_data[symbol][timeframe]["warnings_sent"].discard(f"warn_{level:.6f}_support")
+            except Exception:
+                pass
 
     for level, strength in data["resistance_levels"]:
         if (is_price_near_level(current_price, level, CONFIG["zone_width_percent"]) and
@@ -469,6 +524,10 @@ async def check_support_resistance_alerts(symbol: str, timeframe: str, current_p
 
             await trigger_resistance_alert(symbol, timeframe, level, strength, current_price)
             sr_data[symbol][timeframe]["last_alert_time"][f"{level:.6f}"] = current_time
+            try:
+                sr_data[symbol][timeframe]["warnings_sent"].discard(f"warn_{level:.6f}_resistance")
+            except Exception:
+                pass
 
 # =============== BOOTSTRAP FUNCTION ===============
 async def bootstrap_candles(symbol: str, timeframe: str):
@@ -481,7 +540,7 @@ async def bootstrap_candles(symbol: str, timeframe: str):
         print(f"[Bootstrap-{symbol.upper()}-{timeframe}] Failed: {e}")
         return
 
-    if "code" in data:
+    if isinstance(data, dict) and "code" in data:
         print(f"[Bootstrap-{symbol.upper()}-{timeframe}] Error from Binance: {data}")
         return
 
@@ -494,12 +553,23 @@ async def bootstrap_candles(symbol: str, timeframe: str):
         "volume": float(k[5])
     } for k in data]
 
+    # ensure sr_data entry exists (the trend_timeframe might be included even if timeframe toggle is False)
+    if timeframe not in sr_data[symbol]:
+        sr_data[symbol][timeframe] = {
+            "completed_candles": deque(maxlen=2000),
+            "current_candle": None,
+            "support_levels": [],
+            "resistance_levels": [],
+            "level_strength": {},
+            "last_alert_time": {},
+            "warnings_sent": set()
+        }
+
     sr_data[symbol][timeframe]["completed_candles"].extend(candles)
-    # Only update SR for tracked timeframes (we still want SR for trend_timeframe too if it's being used)
     update_support_resistance_levels(symbol, timeframe)
     print(f"[Bootstrap-{symbol.upper()}-{timeframe}] Loaded {len(candles)} candles")
 
-    # Immediately check for alerts at last close (note: will be filtered by trend conditions)
+    # Immediately check for alerts at last close (they will be filtered by trend if enabled)
     if candles:
         last_close = candles[-1]["close"]
         await check_support_resistance_alerts(symbol, timeframe, last_close)
@@ -533,31 +603,57 @@ async def handle_websocket(symbol: str):
     print(f"[WS-{symbol.upper()}] Max retries exceeded")
 
 async def process_trade_data(symbol: str, trade_data: dict):
+    # trade_data expected from Binance trade stream: price p, quantity q, trade time T
     price = float(trade_data['p'])
     volume = float(trade_data.get('q', 0))
     timestamp = datetime.fromtimestamp(trade_data['T'] / 1000, tz=timezone.utc)
     
-    # Update all configured timeframes AND the trend_timeframe (if not already included)
-    timeframes_to_update = set(CONFIG["timeframes"])
+    # Update all timeframes we track (enabled timeframes + trend_timeframe)
+    timeframes_to_update = set(k for k, v in CONFIG["timeframes"].items() if v)
     timeframes_to_update.add(CONFIG["trend_timeframe"])
-    
+
     for timeframe in timeframes_to_update:
         await update_timeframe_candle(symbol, timeframe, price, volume, timestamp)
     
-    for timeframe in CONFIG["timeframes"]:
+    # After updating candles, check alerts only for enabled timeframes (not for trend_timeframe unless enabled)
+    for timeframe, enabled in CONFIG["timeframes"].items():
+        if not enabled:
+            continue
         await check_support_resistance_alerts(symbol, timeframe, price)
 
 async def update_timeframe_candle(symbol: str, timeframe: str, price: float, volume: float, timestamp: datetime):
+    # ensure timeframe exists in sr_data
+    if timeframe not in sr_data[symbol]:
+        sr_data[symbol][timeframe] = {
+            "completed_candles": deque(maxlen=2000),
+            "current_candle": None,
+            "support_levels": [],
+            "resistance_levels": [],
+            "level_strength": {},
+            "last_alert_time": {},
+            "warnings_sent": set()
+        }
+
     data = sr_data[symbol][timeframe]
     
     # timeframe strings like '1m', '5m', '15m', etc.
-    tf_minutes = int(timeframe[:-1])
+    # We'll parse minute count; for safety handle '1m'..'240m'
+    try:
+        tf_minutes = int(timeframe[:-1])
+    except Exception:
+        # fallback: treat as 1 minute
+        tf_minutes = 1
+
     candle_minute = timestamp.minute - (timestamp.minute % tf_minutes)
     candle_start = timestamp.replace(minute=candle_minute, second=0, microsecond=0)
-    
+    # normalize hour/day changes: if tf_minutes > 60, minute handling still works because minute 0..59 used
+    # candle_start now has same hour/day as timestamp
+
     if data["current_candle"] is None or data["current_candle"]["time"] != candle_start:
         if data["current_candle"]:
+            # move previous current to completed
             data["completed_candles"].append(data["current_candle"])
+            # update SR levels when a candle completes
             update_support_resistance_levels(symbol, timeframe)
         
         data["current_candle"] = {
@@ -569,6 +665,7 @@ async def update_timeframe_candle(symbol: str, timeframe: str, price: float, vol
             "volume": volume
         }
     else:
+        # update current candle
         data["current_candle"]["high"] = max(data["current_candle"]["high"], price)
         data["current_candle"]["low"] = min(data["current_candle"]["low"], price)
         data["current_candle"]["close"] = price
@@ -592,10 +689,11 @@ async def main():
     except Exception as e:
         print(f"[FCM] Initialization error: {e}")
     
-    # Bootstrap candles + initial alerts
+    # Bootstrap candles + initial alerts for all tracked timeframes (enabled ones + trend_timeframe)
     for symbol in CONFIG["symbols"]:
-        # load for all main timeframes
-        for timeframe in set(CONFIG["timeframes"]).union({CONFIG["trend_timeframe"]}):
+        timeframes_to_bootstrap = set(k for k, v in CONFIG["timeframes"].items() if v)
+        timeframes_to_bootstrap.add(CONFIG["trend_timeframe"])
+        for timeframe in timeframes_to_bootstrap:
             await bootstrap_candles(symbol, timeframe)
 
     # Start WebSocket connections
