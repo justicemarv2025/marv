@@ -5,6 +5,8 @@ import time
 from datetime import datetime, timezone, timedelta
 from collections import deque
 from typing import Dict, Deque, Optional, List
+import gspread
+from google.oauth2.service_account import Credentials
 
 import aiohttp
 from aiohttp import web
@@ -42,32 +44,31 @@ SYMBOLS = [
 
 CONFIG = {
     "symbols": SYMBOLS,
-    "interval": "5m",
-    "bootstrap_candles": 50,
-    "cci_length": 20,
-    "signal_length": 14,
-    "signal_type": "sma",
-    "zone_high": 95,
-    "zone_low": -95,
-    "min_cross_gap_minutes": 15,
+    "timeframe": "1m",  # Variable timeframe
+    "ema_fast": 20,     # Variable fast EMA
+    "ema_slow": 200,    # Variable slow EMA
+    "bootstrap_candles": 300,  # Enough candles for 200 EMA calculation
+    
+    # Alert settings
+    "min_touch_gap_minutes": 30,  # Minimum time between same-direction alerts
     "print_interval_sec": 30,
-    "close_grace_sec": 2,
-    "signal_minute": 4,
-    "signal_second": 35,
-
-    "use_tick_updates": False,
-
+    
+    # Google Sheets logging
+    "enable_google_sheets_logging": False,  # Toggle for Google Sheets logging
+    
+    # Alert methods
     "alerts": {
         "telegram": True,
-        "playfile": False,
-        "plyer": False,
         "fcm": True
     },
-    "alarm_file": "alarm.wav",
-
+    
+    # API keys and tokens
     "TELEGRAM_TOKEN": os.environ.get("TELEGRAM_TOKEN", ""),
     "CHAT_ID": os.environ.get("CHAT_ID", ""),
-    "DEVICE_TOKENS_FILE": "device_token_lists.json"
+    "DEVICE_TOKENS_FILE": "device_token_lists.json",
+    
+    # Google Sheets credentials (for logging)
+    "GOOGLE_SHEETS_CREDENTIALS": os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
 }
 # ============================================
 
@@ -79,18 +80,84 @@ for symbol in SYMBOLS:
     symbol_data[symbol] = {
         "completed_candles": deque(maxlen=500),
         "current_candle": None,
-        "last_cross_time": None,
-        "prev_diff": None,
-        "signal_history": deque(maxlen=100),
-        "prev_signal": None,
+        "last_touch_time": {"up": None, "down": None},  # Track last touch time for each direction
+        "prev_fast_ema": None,
+        "prev_slow_ema": None,
         "last_print_time": 0,
-        "signal_sent_this_candle": False,
-        "prev_diff_early": None,
-        "last_early_check_time": 0
+        "ema_history": deque(maxlen=10)  # Keep recent EMA values for touch detection
     }
 
 # Firebase app instance
 firebase_app = None
+# Google Sheets client
+google_sheets_client = None
+
+# ------------- GOOGLE SHEETS INITIALIZATION ----------------
+def init_google_sheets():
+    global google_sheets_client
+    if not CONFIG["enable_google_sheets_logging"]:
+        print("[Google Sheets] Logging disabled in config")
+        return
+    
+    try:
+        google_cred_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS")
+        if not google_cred_json:
+            print("[Google Sheets] GOOGLE_SHEETS_CREDENTIALS environment variable not set")
+            return
+            
+        cred_dict = json.loads(google_cred_json)
+        scopes = ['https://www.googleapis.com/auth/spreadsheets']
+        credentials = Credentials.from_service_account_info(cred_dict, scopes=scopes)
+        google_sheets_client = gspread.authorize(credentials)
+        print("[Google Sheets] Initialized successfully")
+        
+    except json.JSONDecodeError as e:
+        print(f"[Google Sheets] Error parsing credentials: {e}")
+    except Exception as e:
+        print(f"[Google Sheets] init error: {e}")
+        google_sheets_client = None
+
+def get_sheet_filename(symbol: str) -> str:
+    timeframe = CONFIG["timeframe"].replace("m", "min").replace("h", "hour").replace("d", "day")
+    return f"{symbol}_{timeframe}_ematouch.json"
+
+async def log_to_google_sheets(symbol: str, touch_type: str, ema_fast: float, ema_slow: float):
+    if not CONFIG["enable_google_sheets_logging"] or not google_sheets_client:
+        return
+    
+    try:
+        # Create or get the spreadsheet
+        filename = get_sheet_filename(symbol)
+        try:
+            spreadsheet = google_sheets_client.open(filename)
+        except gspread.SpreadsheetNotFound:
+            spreadsheet = google_sheets_client.create(filename)
+            # Share with yourself (optional)
+            # spreadsheet.share('your-email@gmail.com', perm_type='user', role='writer')
+        
+        # Get or create worksheet
+        try:
+            worksheet = spreadsheet.worksheet("EMA Touches")
+        except gspread.WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(title="EMA Touches", rows=1000, cols=6)
+            # Add headers
+            worksheet.append_row(["Alert Time", "Symbol", "Timeframe", "Touch Type", "EMA Fast", "EMA Slow"])
+        
+        # Append the data
+        alert_time = datetime.now(timezone.utc).isoformat()
+        worksheet.append_row([
+            alert_time,
+            symbol.upper(),
+            CONFIG["timeframe"],
+            touch_type.upper(),
+            round(ema_fast, 4),
+            round(ema_slow, 4)
+        ])
+        
+        print(f"[Google Sheets] Logged {symbol} {touch_type} touch to {filename}")
+        
+    except Exception as e:
+        print(f"[Google Sheets] Error logging to sheet: {e}")
 
 # ------------- FCM INITIALIZATION ----------------
 def init_firebase():
@@ -150,7 +217,7 @@ def load_valid_tokens():
             continue
     return valid
 
-def send_fcm_alert(sound_type="up", message="CCI Alert Triggered"):
+def send_fcm_alert(sound_type="up", message="EMA Touch Alert Triggered"):
     if not CONFIG["alerts"]["fcm"]:
         return
     
@@ -206,7 +273,7 @@ async def send_fcm_notification(title, message, sound_type):
         send_fcm_alert(sound_type, f"{title}: {message}")
     
     token = os.environ.get("FCM_TOKEN", "")
-    topic = os.environ.get("FCM_TOPIC", "cci_alerts")
+    topic = os.environ.get("FCM_TOPIC", "ema_touch_alerts")
     if not token:
         print("[FCM HTTP] token not set; skipping FCM HTTP notification.")
         return
@@ -232,109 +299,125 @@ async def send_fcm_notification(title, message, sound_type):
     except Exception as e:
         print("[FCM HTTP] error", e)
 
-def play_alert():
-    pass
-
-# ------------- CCI CALC ----------------
-def compute_cci(candles, length=20):
-    if len(candles) < length:
+# ------------- EMA CALCULATION ----------------
+def calculate_ema(prices, period):
+    """Calculate EMA for given prices and period"""
+    if len(prices) < period:
         return None
-    closes = np.array([c['close'] for c in candles])
-    highs = np.array([c['high'] for c in candles])
-    lows = np.array([c['low'] for c in candles])
-    tps = (highs + lows + closes) / 3
-    tp = tps[-1]
-    sma = np.mean(tps[-length:])
-    md = np.mean(np.abs(tps[-length:] - sma))
-    if md == 0:
-        return 0
-    return (tp - sma) / (0.015 * md)
+    
+    # Simple EMA calculation
+    alpha = 2 / (period + 1)
+    ema = prices[0]
+    
+    for price in prices[1:]:
+        ema = (price * alpha) + (ema * (1 - alpha))
+    
+    return ema
 
-def update_signal(cci_values, length, signal_type="ema"):
-    if len(cci_values) < length:
+def calculate_emas(candles, fast_period, slow_period):
+    """Calculate both fast and slow EMAs"""
+    if len(candles) < slow_period:
+        return None, None
+    
+    closes = [candle['close'] for candle in candles]
+    
+    # Calculate fast EMA
+    fast_ema = calculate_ema(closes[-fast_period:], fast_period)
+    
+    # Calculate slow EMA
+    slow_ema = calculate_ema(closes, slow_period)
+    
+    return fast_ema, slow_ema
+
+# ------------- TOUCH DETECTION ----------------
+def detect_ema_touch(prev_fast, prev_slow, current_fast, current_slow):
+    """
+    Detect if EMAs have touched.
+    Returns: "up" if fast touches slow from below, "down" if fast touches slow from above, None if no touch
+    """
+    if prev_fast is None or prev_slow is None or current_fast is None or current_slow is None:
         return None
-    if signal_type == "sma":
-        return np.mean(cci_values[-length:])
-    else:
-        cci_array = np.array(cci_values[-length:])
-        weights = np.exp(np.linspace(-1, 0, length))
-        weights /= weights.sum()
-        return np.dot(cci_array, weights)
+    
+    # Check if EMAs have touched (current values are very close)
+    ema_diff = abs(current_fast - current_slow)
+    touch_threshold = (current_fast + current_slow) / 2 * 0.0001  # 0.01% threshold for touch
+    
+    if ema_diff <= touch_threshold:
+        # Determine direction based on previous positions
+        if prev_fast < prev_slow:  # Fast was below slow
+            return "up"
+        elif prev_fast > prev_slow:  # Fast was above slow
+            return "down"
+    
+    return None
 
-# ------------- ALERT CHECK ----------------
-async def check_cross(symbol: str, use_early_detection=False):
+async def check_ema_touch(symbol: str):
     data = symbol_data[symbol]
-    completed_candles = data["completed_candles"]
-    signal_history = data["signal_history"]
+    completed_candles = list(data["completed_candles"])
     
-    # For early detection, include the current candle
-    if use_early_detection:
-        if data["current_candle"] is None:
-            return
-        tmp_candles = list(completed_candles) + [{
-            "open": data["current_candle"]["open"],
-            "high": data["current_candle"]["high"],
-            "low": data["current_candle"]["low"],
-            "close": data["current_candle"]["close"]
-        }]
-        cci = compute_cci(tmp_candles, CONFIG["cci_length"])
-        if cci is None:
-            return
-        
-        tmp_signal_history = list(signal_history) + [cci]
-        signal = update_signal(tmp_signal_history, CONFIG["signal_length"], CONFIG["signal_type"])
+    # Include current candle if available
+    if data["current_candle"]:
+        all_candles = completed_candles + [data["current_candle"]]
     else:
-        # Standard detection using only completed candles
-        cci = compute_cci(list(completed_candles), CONFIG["cci_length"])
-        if cci is None:
-            return
-        
-        signal_history.append(cci)
-        signal = update_signal(list(signal_history), CONFIG["signal_length"], CONFIG["signal_type"])
+        all_candles = completed_candles
     
-    if signal is None:
+    if len(all_candles) < CONFIG["ema_slow"]:
         return
     
-    if use_early_detection:
-        data_key = "prev_diff_early"
-    else:
-        data_key = "prev_diff"
-        data["prev_signal"] = signal
-
+    # Calculate current EMAs
+    current_fast_ema, current_slow_ema = calculate_emas(all_candles, CONFIG["ema_fast"], CONFIG["ema_slow"])
+    
+    if current_fast_ema is None or current_slow_ema is None:
+        return
+    
+    # Store current EMAs in history
+    data["ema_history"].append({
+        "timestamp": now(),
+        "fast_ema": current_fast_ema,
+        "slow_ema": current_slow_ema
+    })
+    
+    # Print status periodically
     if time.time() - data["last_print_time"] > CONFIG["print_interval_sec"]:
-        print(f"[CCI-{symbol.upper()}] {now()} CCI={cci:.3f} Signal={signal:.3f}")
+        print(f"[EMA-{symbol.upper()}] {now()} Fast EMA={current_fast_ema:.4f} Slow EMA={current_slow_ema:.4f} Diff={(current_fast_ema-current_slow_ema):.4f}")
         data["last_print_time"] = time.time()
-
-    diff = cci - signal
-    prev_diff = data[data_key]
-
-    crossed_up = prev_diff is not None and prev_diff < 0 and diff > 0
-    crossed_down = prev_diff is not None and prev_diff > 0 and diff < 0
-
-    if crossed_up or crossed_down:
+    
+    # Check for touch detection
+    touch_type = detect_ema_touch(
+        data["prev_fast_ema"], 
+        data["prev_slow_ema"], 
+        current_fast_ema, 
+        current_slow_ema
+    )
+    
+    if touch_type:
         current_time = now()
-        time_since_last = current_time - data["last_cross_time"] if data["last_cross_time"] else timedelta(minutes=CONFIG["min_cross_gap_minutes"] + 1)
+        last_touch_time = data["last_touch_time"][touch_type]
         
-        if data["last_cross_time"] is None or time_since_last > timedelta(minutes=CONFIG["min_cross_gap_minutes"]):
-            data["last_cross_time"] = current_time
-            direction = "UP" if crossed_up else "DOWN"
-            sound_type = "up" if crossed_up else "down"
-            detection_type = "EARLY" if use_early_detection else "FINAL"
-            msg = f"🚨 {symbol.upper()} CCI CROSS {direction} ({detection_type}) | CCI={cci:.2f} Signal={signal:.2f} Time={current_time}"
-            print(f"[alert-{symbol.upper()}]", msg)
-            await send_telegram(msg)
-            await send_fcm_notification(f"{symbol.upper()} CCI Cross {direction}", f"CCI: {cci:.2f}, Signal: {signal:.2f}", sound_type)
+        # Check if enough time has passed since last same-direction touch
+        if last_touch_time is None or (current_time - last_touch_time) > timedelta(minutes=CONFIG["min_touch_gap_minutes"]):
+            data["last_touch_time"][touch_type] = current_time
             
-            # Mark signal as sent for this candle if it's an early detection
-            if use_early_detection:
-                data["signal_sent_this_candle"] = True
-                data["last_early_check_time"] = time.time()
-
-    data[data_key] = diff
+            sound_type = "up" if touch_type == "up" else "down"
+            msg = f"🚨 {symbol.upper()} EMA TOUCH {touch_type.upper()} | Fast EMA={current_fast_ema:.4f} Slow EMA={current_slow_ema:.4f} Time={current_time}"
+            print(f"[alert-{symbol.upper()}]", msg)
+            
+            # Send alerts
+            await send_telegram(msg)
+            await send_fcm_notification(f"{symbol.upper()} EMA Touch {touch_type.upper()}", 
+                                      f"Fast EMA: {current_fast_ema:.4f}, Slow EMA: {current_slow_ema:.4f}", 
+                                      sound_type)
+            
+            # Log to Google Sheets
+            await log_to_google_sheets(symbol, touch_type, current_fast_ema, current_slow_ema)
+    
+    # Update previous values
+    data["prev_fast_ema"] = current_fast_ema
+    data["prev_slow_ema"] = current_slow_ema
 
 # ------------- DATA HANDLING ----------------
 async def bootstrap(symbol: str):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval={CONFIG['interval']}&limit={CONFIG['bootstrap_candles']}"
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval={CONFIG['timeframe']}&limit={CONFIG['bootstrap_candles']}"
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as resp:
@@ -352,89 +435,63 @@ async def bootstrap(symbol: str):
         return
     
     completed_candles = symbol_data[symbol]["completed_candles"]
-    signal_history = symbol_data[symbol]["signal_history"]
     
     for k in data:
         candle = {
             "open": float(k[1]),
             "high": float(k[2]),
             "low": float(k[3]),
-            "close": float(k[4])
+            "close": float(k[4]),
+            "volume": float(k[5]),
+            "timestamp": datetime.fromtimestamp(k[0]/1000, tz=timezone.utc)
         }
         completed_candles.append(candle)
-        cci_val = compute_cci(list(completed_candles), CONFIG["cci_length"])
-        if cci_val is not None:
-            signal_history.append(cci_val)
     
-    print(f"[bootstrap-{symbol.upper()}] completed_candles: {len(completed_candles)}, signal_history: {len(signal_history)}")
+    print(f"[bootstrap-{symbol.upper()}] loaded {len(completed_candles)} candles")
 
 async def handle_trade(symbol: str, trade: dict):
     data = symbol_data[symbol]
     price = float(trade['p'])
     ts = int(trade['T'])
     dt = datetime.fromtimestamp(ts/1000, tz=timezone.utc)
-    minute = dt.minute - dt.minute % 5
-    candle_open = dt.replace(second=0, microsecond=0, minute=minute)
+    
+    # Determine candle boundaries based on timeframe
+    if CONFIG['timeframe'].endswith('m'):
+        minutes = int(CONFIG['timeframe'][:-1])
+        minute = dt.minute - (dt.minute % minutes)
+        candle_open = dt.replace(second=0, microsecond=0, minute=minute)
+    elif CONFIG['timeframe'].endswith('h'):
+        hours = int(CONFIG['timeframe'][:-1])
+        hour = dt.hour - (dt.hour % hours)
+        candle_open = dt.replace(second=0, microsecond=0, minute=0, hour=hour)
+    else:
+        # Default to 1 minute if unknown format
+        candle_open = dt.replace(second=0, microsecond=0)
 
     if data["current_candle"] is None or candle_open != data["current_candle"]["time"]:
-        # Reset signal flag for new candle
-        data["signal_sent_this_candle"] = False
-        data["prev_diff_early"] = None
-        
+        # New candle started
         if data["current_candle"]:
-            data["completed_candles"].append({
-                "open": data["current_candle"]["open"],
-                "high": data["current_candle"]["high"],
-                "low": data["current_candle"]["low"],
-                "close": data["current_candle"]["close"]
-            })
+            data["completed_candles"].append(data["current_candle"])
             print(f"[candle-{symbol.upper()}] closed {data['current_candle']['time']}")
-            await check_cross(symbol, use_early_detection=False)
         
-        data["current_candle"] = {"time": candle_open, "open": price, "high": price, "low": price, "close": price}
+        data["current_candle"] = {
+            "time": candle_open, 
+            "open": price, 
+            "high": price, 
+            "low": price, 
+            "close": price,
+            "volume": 0
+        }
         print(f"[candle-{symbol.upper()}] opened new candle at {candle_open}")
     else:
+        # Update current candle
         data["current_candle"]["close"] = price
         data["current_candle"]["high"] = max(data["current_candle"]["high"], price)
         data["current_candle"]["low"] = min(data["current_candle"]["low"], price)
+        data["current_candle"]["volume"] += float(trade['q'])
 
-    if CONFIG["use_tick_updates"]:
-        tmp_candles = list(data["completed_candles"]) + [{
-            "open": data["current_candle"]["open"],
-            "high": data["current_candle"]["high"],
-            "low": data["current_candle"]["low"],
-            "close": data["current_candle"]["close"]
-        }]
-        cci = compute_cci(tmp_candles, CONFIG["cci_length"])
-        if cci:
-            tmp_signal_history = list(data["signal_history"]) + [cci]
-            signal = update_signal(tmp_signal_history, CONFIG["signal_length"], CONFIG["signal_type"])
-            if signal:
-                pass
-
-# ------------- DEDICATED EARLY SIGNAL TIMER ----------------
-async def check_early_signals_periodically():
-    print("[Early Signal Timer] Started dedicated early signal timer task.")
-    while True:
-        current_utc_time = now()
-        await asyncio.sleep(1)
-
-        for symbol in CONFIG['symbols']:
-            data = symbol_data[symbol]
-            if data["current_candle"] is None:
-                continue
-
-            if data["signal_sent_this_candle"]:
-                continue
-
-            candle_start = data["current_candle"]["time"]
-            time_in_candle = current_utc_time - candle_start
-            target_time_sec = (CONFIG["signal_minute"] * 60) + CONFIG["signal_second"]
-
-            if time_in_candle.total_seconds() >= target_time_sec:
-                if time.time() - data["last_early_check_time"] > 0.5:
-                    print(f"[{symbol.upper()}] ⌛ PERIODIC CHECK: Triggering early signal at {current_utc_time} ({time_in_candle.total_seconds():.1f}s into candle)")
-                    await check_cross(symbol, use_early_detection=True)
+    # Check for EMA touch on every trade (real-time detection)
+    await check_ema_touch(symbol)
 
 # ------------- WEBSOCKET HANDLING ----------------
 async def ws_loop(symbol: str):
@@ -466,18 +523,18 @@ async def symbol_worker(symbol: str):
 async def worker_loop():
     print("[init alert] Sending initialization alert")
     init_firebase()
-    send_fcm_alert("up", "Multi-Symbol CCI Alert System Initialization complete")
-    await send_telegram("Multi-Symbol CCI Alert System Initialization complete")
+    init_google_sheets()
     
-    early_signal_task = asyncio.create_task(check_early_signals_periodically())
+    send_fcm_alert("up", "EMA Touch Alert System Initialization complete")
+    await send_telegram("EMA Touch Alert System Initialization complete")
     
     symbol_tasks = [asyncio.create_task(symbol_worker(symbol)) for symbol in SYMBOLS]
     
-    await asyncio.gather(early_signal_task, *symbol_tasks, return_exceptions=True)
+    await asyncio.gather(*symbol_tasks, return_exceptions=True)
 
 # ------------- HTTP SERVER ----------------
 async def health(request):
-    return web.Response(text="Multi-Symbol CCI Alert System OK")
+    return web.Response(text="EMA Touch Alert System OK")
 
 async def on_startup(app):
     print("[app] starting background workers")
