@@ -5,3 +5,4 @@ firebase-admin>=6.0.0
 supervisor
 python-dotenv
 gspread
+mpl_finance
