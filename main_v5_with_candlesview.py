@@ -41,7 +41,8 @@ else:
     print("Running in production environment, using system environment variables")
 
 # ================== CONFIG ==================
-SYMBOLS = ["ethusdt"]
+# Customizable symbol list - easily add/remove pairs here
+SYMBOLS = ["ethusdt", "linkusdt", "aaveusdt", "fetusdt"]  # Add your desired pairs
 
 # EMA Color Configuration
 EMA_COLORS = {
@@ -88,7 +89,8 @@ CONFIG = {
     "GOOGLE_SHEETS_CREDENTIALS": os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
 }
 
-# ================== DATA ==================
+# ================== DATA STRUCTURE ==================
+# Initialize data structure for ALL symbols
 symbol_data: Dict[str, Dict] = {}
 for symbol in SYMBOLS:
     symbol_data[symbol] = {
@@ -211,21 +213,22 @@ def send_fcm_test_alerts():
     if not CONFIG["alerts"]["fcm"] or not firebase_app:
         return
     
-    symbol = SYMBOLS[0]
-    timeframe = CONFIG["timeframe"]
-    strategy = CONFIG["strategy"]
-    
-    test_alerts = [
-        f"{symbol}_{timeframe}_{strategy}_up_warning",
-        f"{symbol}_{timeframe}_{strategy}_down_warning", 
-        f"{symbol}_{timeframe}_{strategy}_up",
-        f"{symbol}_{timeframe}_{strategy}_down"
-    ]
-    
-    print("[FCM] Sending test alerts for initialization confirmation...")
-    for alert_type in test_alerts:
-        send_fcm_alert(alert_type, f"FCM Test Alert: {alert_type}")
-        time.sleep(1)  # Small delay between test alerts
+    # Test alerts for all symbols
+    for symbol in SYMBOLS:
+        timeframe = CONFIG["timeframe"]
+        strategy = CONFIG["strategy"]
+        
+        test_alerts = [
+            f"{symbol}_{timeframe}_{strategy}_up_warning",
+            f"{symbol}_{timeframe}_{strategy}_down_warning", 
+            f"{symbol}_{timeframe}_{strategy}_up",
+            f"{symbol}_{timeframe}_{strategy}_down"
+        ]
+        
+        print(f"[FCM] Sending test alerts for {symbol}...")
+        for alert_type in test_alerts:
+            send_fcm_alert(alert_type, f"FCM Test Alert: {alert_type}")
+            time.sleep(0.5)  # Reduced delay between test alerts
 
 # ================== UTILITIES ==================
 def now():
@@ -415,25 +418,30 @@ async def check_ema_alerts(symbol: str):
 
 # ================== BOOTSTRAP CANDLES ==================
 async def bootstrap_candles(symbol: str):
+    """Bootstrap historical candles for a symbol"""
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval={CONFIG['timeframe']}&limit={CONFIG['bootstrap_candles']}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            data = await resp.json()
-    candles = []
-    for c in data:
-        candles.append({
-            "timestamp": datetime.fromtimestamp(c[0]/1000, tz=timezone.utc),
-            "open": float(c[1]),
-            "high": float(c[2]),
-            "low": float(c[3]),
-            "close": float(c[4]),
-            "volume": float(c[5])
-        })
-    symbol_data[symbol]["completed_candles"].extend(candles)
-    print(f"[bootstrap] Loaded {len(candles)} candles for {symbol}")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                data = await resp.json()
+        candles = []
+        for c in data:
+            candles.append({
+                "timestamp": datetime.fromtimestamp(c[0]/1000, tz=timezone.utc),
+                "open": float(c[1]),
+                "high": float(c[2]),
+                "low": float(c[3]),
+                "close": float(c[4]),
+                "volume": float(c[5])
+            })
+        symbol_data[symbol]["completed_candles"].extend(candles)
+        print(f"[bootstrap] Loaded {len(candles)} candles for {symbol}")
+    except Exception as e:
+        print(f"[bootstrap] Error loading candles for {symbol}: {e}")
 
 # ================== LIVE WEBSOCKET ==================
 async def kline_listener(symbol: str):
+    """WebSocket listener for a single symbol"""
     url = f"wss://stream.binance.com:9443/ws/{symbol}@kline_{CONFIG['timeframe']}"
     async for ws in websockets.connect(url):
         try:
@@ -455,9 +463,19 @@ async def kline_listener(symbol: str):
                 else:
                     symbol_data[symbol]["current_candle"] = candle
         except Exception as e:
-            print(f"[websocket] error {e}, reconnecting...")
+            print(f"[websocket-{symbol}] error {e}, reconnecting...")
             await asyncio.sleep(5)
             continue
+
+async def start_all_listeners():
+    """Start WebSocket listeners for all symbols"""
+    tasks = []
+    for symbol in SYMBOLS:
+        task = asyncio.create_task(kline_listener(symbol))
+        tasks.append(task)
+        print(f"[listener] Started WebSocket for {symbol}")
+    # Wait for all tasks to complete (they shouldn't unless there's an error)
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 # ================== CHART SENDING ==================
 async def send_chart(symbol: str, alert_type: str = "update"):
@@ -517,7 +535,6 @@ async def send_chart(symbol: str, alert_type: str = "update"):
                 # Convert times to matplotlib format for plotting
                 valid_dates = [mdates.date2num(t) for t in valid_times]
                 ax.plot(valid_dates, valid_ema, label=f"EMA{period}", color=color, linewidth=1.5)
-                print(f"[chart] Plotted EMA{period} with {len(valid_data)} data points")
     
     plt.legend()
     
@@ -619,30 +636,34 @@ async def set_alert_gaps(request):
 
 # ================== APP ==================
 async def on_startup(app):
+    """Initialize everything on startup"""
+    print(f"[startup] Initializing multi-pair bot for {len(SYMBOLS)} symbols: {SYMBOLS}")
+    
     init_firebase()
     init_google_sheets()
-    for symbol in SYMBOLS:
-        await bootstrap_candles(symbol)
-        app[f'worker_{symbol}'] = asyncio.create_task(kline_listener(symbol))
+    
+    # Bootstrap candles for all symbols concurrently
+    bootstrap_tasks = [bootstrap_candles(symbol) for symbol in SYMBOLS]
+    await asyncio.gather(*bootstrap_tasks)
+    
+    # Start WebSocket listeners for all symbols
+    app['listeners_task'] = asyncio.create_task(start_all_listeners())
     app['worker_chart'] = asyncio.create_task(chart_sender_loop())
-    await send_telegram("EMA Touch Alert System Initialization complete")
+    
+    await send_telegram(f"Multi-pair EMA Alert System Initialized with {len(SYMBOLS)} symbols: {', '.join(SYMBOLS)}")
 
 async def on_cleanup(app):
-    for symbol in SYMBOLS:
-        task = app.get(f'worker_{symbol}')
+    """Cleanup tasks on shutdown"""
+    # Cancel all running tasks
+    tasks_to_cancel = ['listeners_task', 'worker_chart']
+    for task_name in tasks_to_cancel:
+        task = app.get(task_name)
         if task:
             task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
                 pass
-    task = app.get('worker_chart')
-    if task:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
 
 def create_app():
     app = web.Application()
@@ -658,4 +679,5 @@ def create_app():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app = create_app()
+    print(f"[main] Starting multi-pair trading bot on port {port}")
     web.run_app(app, host="0.0.0.0", port=port)
