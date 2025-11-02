@@ -5,8 +5,6 @@ import time
 from datetime import datetime, timezone, timedelta
 from collections import deque
 from typing import Dict, Deque, List
-import gspread
-from google.oauth2.service_account import Credentials
 
 import aiohttp
 from aiohttp import web
@@ -71,7 +69,7 @@ CONFIG = {
     # Chart sending
     "enable_chart_sending": True,
     "send_chart_on_alert": True,          # Toggle to send chart image for each alert
-    "chart_interval_sec": 60,
+    "chart_interval_sec": 5,
 
     # Alert methods
     "alerts": {
@@ -84,7 +82,7 @@ CONFIG = {
     "CHAT_ID": os.environ.get("CHAT_ID", ""),
     "DEVICE_TOKENS_FILE": "device_token_lists.json",
 
-    # Google Sheets
+    # Google Sheets (keeping for reference but functionality removed)
     "enable_google_sheets_logging": False,
     "GOOGLE_SHEETS_CREDENTIALS": os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
 }
@@ -104,26 +102,6 @@ for symbol in SYMBOLS:
     }
 
 firebase_app = None
-google_sheets_client = None
-
-# ================== GOOGLE SHEETS ==================
-def init_google_sheets():
-    global google_sheets_client
-    if not CONFIG["enable_google_sheets_logging"]:
-        return
-    try:
-        google_cred_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS")
-        if not google_cred_json:
-            return
-        cred_dict = json.loads(google_cred_json)
-        if 'private_key' in cred_dict:
-            cred_dict['private_key'] = cred_dict['private_key'].replace('\\n', '\n')
-        scopes = ['https://www.googleapis.com/auth/spreadsheets']
-        credentials = Credentials.from_service_account_info(cred_dict, scopes=scopes)
-        google_sheets_client = gspread.authorize(credentials)
-        print("[Google Sheets] Initialized successfully")
-    except Exception as e:
-        print(f"[Google Sheets] init error: {e}")
 
 # ================== FIREBASE ==================
 def init_firebase():
@@ -640,7 +618,6 @@ async def on_startup(app):
     print(f"[startup] Initializing multi-pair bot for {len(SYMBOLS)} symbols: {SYMBOLS}")
     
     init_firebase()
-    init_google_sheets()
     
     # Bootstrap candles for all symbols concurrently
     bootstrap_tasks = [bootstrap_candles(symbol) for symbol in SYMBOLS]
