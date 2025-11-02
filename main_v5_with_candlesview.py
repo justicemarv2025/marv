@@ -69,7 +69,7 @@ CONFIG = {
     # Chart sending
     "enable_chart_sending": True,
     "send_chart_on_alert": True,          # Toggle to send chart image for each alert
-    "chart_interval_sec": 5,
+    "chart_interval_sec": 120,
 
     # Alert methods
     "alerts": {
